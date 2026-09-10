@@ -12,6 +12,8 @@ nothing about which program it is, so the join is not optional.
 
 from __future__ import annotations
 
+import re
+
 # The shell itself watches levels for the bar; it is not a meeting.
 IGNORED = {"quickshell"}
 
@@ -134,42 +136,111 @@ def pid_chain(pid, ppid=read_ppid) -> list:
     return chain
 
 
+# Five characters of a shared prefix, because `chromium` and `chrome` are the
+# same brand and neither contains the other. Only ever applied to program
+# identifiers, never to a window title: a class and a binary are chosen by the
+# same developer, and the false-positive cost here is one wrong title rather
+# than a truncated one.
+BRAND_PREFIX = 5
+
+
+def related(window_class, binary) -> bool:
+    """Could this window belong to that program?
+
+    `google-chrome` and `chrome` by containment, `chromium` and `chrome` by
+    prefix, `com.mitchellh.ghostty` and `pw-cat` not at all.
+    """
+    left = re.sub(r"[^a-z0-9]", "", str(window_class or "").lower())
+    right = re.sub(r"[^a-z0-9]", "", str(binary or "").lower())
+    if not left or not right:
+        return False
+    if left in right or right in left:
+        return True
+    return (
+        len(left) >= BRAND_PREFIX
+        and len(right) >= BRAND_PREFIX
+        and left[:BRAND_PREFIX] == right[:BRAND_PREFIX]
+    )
+
+
 def window_title(pid, windows, binary=None, chain=None):
     """The title of the window the capture belongs to, cleaned up.
 
-    By pid first, because that is the only answer that cannot be wrong; by
-    class name second, because a browser's audio child sometimes has no window
-    anywhere in its ancestry.
+    Three passes, in order of how much they can be trusted:
+
+    1. The capturing pid's own window. Cannot be wrong.
+    2. An ancestor's window, but only one that plausibly belongs to the same
+       program. Chromium captures from a child process, so ancestry is
+       necessary; without the class check it also means `pw-record` inherits
+       the title of the terminal it was typed into, which is how a meeting
+       ended up named after a text editor.
+    3. Any window of the same program, most recently focused first, because a
+       browser's audio child sometimes has no window in its ancestry at all.
     """
     owned = chain if chain is not None else pid_chain(pid)
+    ranked = sorted(
+        (w for w in (windows or []) if isinstance(w, dict)),
+        key=lambda w: w.get("focusHistoryID", 1 << 30),
+    )
     by_pid = {}
-    for window in windows or []:
+    for window in ranked:
         by_pid.setdefault(window.get("pid"), window)
-    for candidate in owned:
+
+    own = by_pid.get(owned[0]) if owned else None
+    if own:
+        return clean_title(own.get("title"), binary)
+
+    for candidate in owned[1:]:
         window = by_pid.get(candidate)
-        if window:
+        if window and related(window.get("class"), binary):
             return clean_title(window.get("title"), binary)
-    if binary:
-        needle = str(binary).lower()
-        for window in windows or []:
-            if needle in str(window.get("class", "")).lower():
-                return clean_title(window.get("title"), binary)
+
+    for window in ranked:
+        if related(window.get("class"), binary):
+            return clean_title(window.get("title"), binary)
     return None
 
 
+# What browsers and meeting apps hang off the end of a title. Stripped by
+# name because the binary is only ever one of them: a Google Meet call in
+# Chromium is titled "Standup - Google Meet - Google Chrome", and the meeting
+# is called Standup.
+TITLE_TAILS = (
+    "google chrome", "chromium", "brave", "firefox", "mozilla firefox",
+    "microsoft edge", "google meet", "microsoft teams", "teams", "zoom",
+    "zoom workplace", "slack", "discord", "webex", "jitsi meet", "whereby",
+)
+
+# Chrome and Firefox prefix a title with the unread count.
+UNREAD = re.compile(r"^\(\d+\)\s*")
+
+# Two brands can stack: "… - Google Meet - Google Chrome".
+MAX_TAILS = 3
+
+
 def clean_title(title, binary):
-    """Drop the application's own name off the end of its window title.
+    """Drop the app's own name, and the service's, off the end of a title.
 
     "Quarterly Review | Microsoft Teams" is a meeting called Quarterly Review.
-    The app name is already recorded separately, so keeping it would put it in
-    the directory name twice.
+    The app is recorded separately, so keeping it would put it in the directory
+    name twice, and a title that is nothing but brands is no title at all.
     """
-    text = str(title or "").strip()
-    needle = str(binary or "").lower()
-    if needle:
-        for separator in TITLE_SEPARATORS:
-            cut = text.rfind(separator)
-            if cut > 0 and needle in text[cut + len(separator) :].lower():
-                text = text[:cut].strip()
-                break
+    text = UNREAD.sub("", str(title or "").strip())
+    for _ in range(MAX_TAILS):
+        shorter = strip_tail(text, binary)
+        if shorter == text:
+            break
+        text = shorter
     return text or None
+
+
+def strip_tail(text: str, binary) -> str:
+    needle = str(binary or "").lower()
+    for separator in TITLE_SEPARATORS:
+        cut = text.rfind(separator)
+        if cut <= 0:
+            continue
+        tail = text[cut + len(separator) :].strip().lower()
+        if (needle and needle in tail) or tail in TITLE_TAILS:
+            return text[:cut].strip()
+    return text

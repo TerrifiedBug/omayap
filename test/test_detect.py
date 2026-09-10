@@ -146,6 +146,51 @@ class TestCleanTitle(unittest.TestCase):
         self.assertIsNone(detect.clean_title(None, "chrome"))
 
 
+class TestTitleTails(unittest.TestCase):
+    """A meeting is what is left when the brands come off."""
+
+    def test_two_brands_stacked(self):
+        self.assertEqual(
+            detect.clean_title("Standup - Google Meet - Google Chrome", "chrome"),
+            "Standup",
+        )
+
+    def test_the_unread_count_goes(self):
+        self.assertEqual(
+            detect.clean_title("(3) Island Progress | Microsoft Teams", "teams"),
+            "Island Progress",
+        )
+
+    def test_a_service_the_binary_does_not_name(self):
+        # The binary is `chrome`; the tail is Zoom's web app.
+        self.assertEqual(
+            detect.clean_title("Weekly Sync - Zoom Workplace", "chrome"), "Weekly Sync"
+        )
+
+    def test_an_ordinary_title_is_left_alone(self):
+        self.assertEqual(
+            detect.clean_title("Notes - my project", "chrome"), "Notes - my project"
+        )
+        self.assertEqual(
+            detect.clean_title("omarchy: dotfiles", "pw-cat"), "omarchy: dotfiles"
+        )
+
+
+class TestRelated(unittest.TestCase):
+    def test_a_class_and_a_binary_agree_on_the_brand(self):
+        self.assertTrue(detect.related("google-chrome", "chrome"))
+        self.assertTrue(detect.related("chromium", "chromium"))
+        self.assertTrue(detect.related("com.microsoft.teams2", "teams"))
+        # Neither contains the other; they share a brand.
+        self.assertTrue(detect.related("chromium", "chrome"))
+
+    def test_unrelated_programs_do_not_match(self):
+        self.assertFalse(detect.related("com.mitchellh.ghostty", "pw-cat"))
+        self.assertFalse(detect.related("foot", "pw-record"))
+        self.assertFalse(detect.related("Alacritty", "chromium"))
+        self.assertFalse(detect.related("", "chrome"))
+
+
 class TestWindowTitle(unittest.TestCase):
     WINDOWS = [
         {"pid": 4321, "class": "chromium", "title": "Quarterly Review - Google Chrome"},
@@ -165,11 +210,26 @@ class TestWindowTitle(unittest.TestCase):
         )
 
     def test_by_class_when_no_ancestor_owns_a_window(self):
-        # The class carries the binary name, and the title's suffix here is
-        # the brand, so the suffix stays: it does not name the binary.
         self.assertEqual(
             detect.window_title(9999, self.WINDOWS, "chromium", chain=[9999]),
-            "Quarterly Review - Google Chrome",
+            "Quarterly Review",
+        )
+
+    def test_a_terminal_ancestor_does_not_name_the_meeting(self):
+        # pw-record inherits nothing from the shell it was typed into: the
+        # ancestor's window has to plausibly belong to the same program.
+        windows = [{"pid": 500, "class": "foot", "title": "omarchy: dotfiles"}]
+        self.assertIsNone(
+            detect.window_title(9999, windows, "pw-cat", chain=[9999, 500])
+        )
+
+    def test_the_most_recently_focused_window_wins(self):
+        windows = [
+            {"pid": 1, "class": "chromium", "title": "Old tab", "focusHistoryID": 7},
+            {"pid": 2, "class": "chromium", "title": "Standup - Google Meet", "focusHistoryID": 0},
+        ]
+        self.assertEqual(
+            detect.window_title(9999, windows, "chromium", chain=[9999]), "Standup"
         )
 
     def test_no_window_anywhere_is_no_title(self):
