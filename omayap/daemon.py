@@ -60,6 +60,12 @@ DETECT_END_GRACE = 16.0
 # poll.
 DETECT_POLL = 30.0
 
+# How long the "click to record" toast stays up. The shell's popup duration is
+# clamped between 5 s and 30 s (plugins/notifications/Service.qml:98-100) and
+# nothing can shorten it once posted, so this is also the worst case for how
+# long a stale offer can sit there.
+OFFER_TOAST_MS = 10000
+
 # While an offer is on screen it has to be true, and 30 s of a stale "click to
 # record" is the difference between a prompt and a nuisance. One pw-dump every
 # few seconds costs about 30 ms and only happens while the toast is up.
@@ -121,37 +127,16 @@ def notify(headline: str, body: str = "", urgency: str = "low", timeout=None, cl
         return None
 
 
-def retire(notification_id, headline: str, body: str = "") -> None:
-    """Replace a toast that has stopped being true, then close it.
-
-    Two calls because the shell does neither job on its own. Its popup
-    duration is clamped to 30 s (plugins/notifications/Service.qml:100), so a
-    120 s offer shows for 30 s whatever we ask; and its `closed` handler only
-    drops an internal reference (:165), so CloseNotification does not take the
-    card off screen. Replacing by id does work and resets the timer, so an
-    expired offer is rewritten as something short and honest, and the close is
-    still sent for the day that is fixed.
-    """
-    if not notification_id:
-        return
-    # -t 1 lands under the low-urgency floor, which is the shortest the shell
-    # will show anything: about five seconds.
-    try:
-        subprocess.Popen(
-            [
-                "omarchy-notification-send", "-r", str(notification_id),
-                "-u", "low", "-t", "1", "-g", GLYPH, headline, body,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except OSError as error:
-        warn(f"cannot retire notification: {error}")
-    withdraw(notification_id)
-
-
 def withdraw(notification_id) -> None:
-    """Take a toast off the screen. omarchy-notification-send only sends."""
+    """Ask the server to close a toast.
+
+    Correct per the freedesktop spec, and currently a no-op on screen: the
+    shell's notification service handles `closed` by dropping an internal
+    reference and leaves the card up (plugins/notifications/Service.qml:165).
+    Replacing by id does land, but as a second card rather than in place, so
+    the offer instead carries a short lifetime and expires on its own. This
+    call stays because it is the right request to make and it costs nothing.
+    """
     if not notification_id:
         return
     try:
@@ -703,9 +688,8 @@ class Daemon:
             return
         if self.pending:
             offer = self.pending
-            if self.pending_toast:
-                retire(self.pending_toast, "omayap", "● recording")
-                self.pending_toast = None
+            withdraw(self.pending_toast)
+            self.pending_toast = None
             self.pending = None
             self.write_state()
             self.start_session(offer.get("title"), offer.get("app"), auto=True)
@@ -858,11 +842,8 @@ class Daemon:
         it ends when the call does, when the user accepts it, when detection is
         turned off, and when the daemon stops.
         """
-        if self.pending_toast:
-            # Says what happened rather than continuing to offer a recording
-            # for a call that is over.
-            retire(self.pending_toast, "omayap", "call ended · not recorded")
-            self.pending_toast = None
+        withdraw(self.pending_toast)
+        self.pending_toast = None
         if self.pending is None:
             return
         self.pending = None
@@ -914,7 +895,12 @@ class Daemon:
         self.pending_toast = notify(
             f"{app} is in a call",
             f"{title or 'Record this meeting?'} · click to record",
-            timeout=30000,  # the shell clamps to 30 s; asking for more is a fiction
+            # Short on purpose. The shell cannot be told to take a toast down
+            # early, so the offer's lifetime is the longest it can be wrong
+            # for: ten seconds, not the thirty its cap allows. The offer also
+            # lives in the daemon's state, so the bar button and the panel
+            # still show it after the toast has gone.
+            timeout=OFFER_TOAST_MS,
             click=[str(CLI), "record"],
             want_id=True,
         )
