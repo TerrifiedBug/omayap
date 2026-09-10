@@ -54,8 +54,16 @@ STALL_AFTER = 45.0
 DETECT_DEBOUNCE = 2.0
 # A call is not over because a client dropped its stream for a moment.
 DETECT_END_GRACE = 16.0
-# Missed-event safety: pactl does not always say when a stream goes idle.
+# Missed-event safety: pactl does not always say when a stream goes idle. A
+# browser leaving a call usually keeps its capture stream and just stops
+# running it, which emits nothing at all, so the state only changes on this
+# poll.
 DETECT_POLL = 30.0
+
+# While an offer is on screen it has to be true, and 30 s of a stale "click to
+# record" is the difference between a prompt and a nuisance. One pw-dump every
+# few seconds costs about 30 ms and only happens while the toast is up.
+PENDING_POLL = 3.0
 
 CLI = Path(__file__).resolve().parent.parent / "bin" / "omayap"
 
@@ -841,7 +849,7 @@ class Daemon:
             return
 
         self.end_at = None
-        self.repoll_at = now + DETECT_POLL
+        self.repoll_at = now + (PENDING_POLL if self.pending else DETECT_POLL)
         if self.in_meeting:
             return
         self.in_meeting = True
@@ -874,6 +882,7 @@ class Daemon:
             click=[str(CLI), "record"],
             want_id=True,
         )
+        self.repoll_at = time.monotonic() + PENDING_POLL
 
     def end_meeting(self) -> None:
         self.end_at = None
