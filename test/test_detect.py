@@ -46,7 +46,7 @@ PW_RECORD = [
 
 class TestCapturing(unittest.TestCase):
     def test_a_running_stream_is_reported_with_its_process(self):
-        dump = [node("Chromium input", app="Chromium"), client(10, "chromium", 4321)]
+        dump = [node("Chromium input", app="Chromium input"), client(10, "chromium", 4321)]
         self.assertEqual(
             detect.capturing(dump),
             [{"pid": 4321, "app": "Chromium", "binary": "chromium"}],
@@ -110,6 +110,18 @@ class TestCapturing(unittest.TestCase):
             detect.capturing([node("mystery", client=None)]),
             [{"pid": None, "app": "mystery", "binary": "mystery"}],
         )
+
+
+class TestPrettyApp(unittest.TestCase):
+    def test_the_stream_direction_comes_off(self):
+        self.assertEqual(detect.pretty_app("Google Chrome input"), "Google Chrome")
+        self.assertEqual(detect.pretty_app("Firefox Capture"), "Firefox")
+        self.assertEqual(detect.pretty_app("Slack"), "Slack")
+
+    def test_a_name_that_is_only_a_direction_survives(self):
+        self.assertEqual(detect.pretty_app("input"), "input")
+        self.assertEqual(detect.pretty_app(""), "")
+        self.assertEqual(detect.pretty_app(None), "")
 
 
 class TestCleanTitle(unittest.TestCase):

@@ -23,6 +23,21 @@ TITLE_SEPARATORS = (" - ", " | ", " — ")
 PPID_HOPS = 8
 
 
+# Streams name themselves after their direction: Chromium's capture stream
+# calls itself "Google Chrome input", which reads badly in "X is in a call".
+STREAM_SUFFIXES = (" input", " output", " capture", " recording")
+
+
+def pretty_app(name: str) -> str:
+    """The app's name without the stream direction glued on the end."""
+    text = str(name or "").strip()
+    lowered = text.lower()
+    for suffix in STREAM_SUFFIXES:
+        if lowered.endswith(suffix) and len(text) > len(suffix):
+            return text[: -len(suffix)].strip()
+    return text
+
+
 def _props(obj) -> dict:
     return ((obj or {}).get("info") or {}).get("props") or {}
 
@@ -71,7 +86,7 @@ def capturing(dump, excluded=()) -> list:
         binary = props.get("application.process.binary") or owner.get(
             "application.process.binary"
         )
-        app = name or binary or node_name
+        app = pretty_app(name) or binary or node_name
         if not app:
             continue
         labels = {str(label).lower() for label in (name, binary, node_name) if label}

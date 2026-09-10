@@ -85,18 +85,52 @@ def warn(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
-def notify(headline: str, body: str = "", urgency: str = "low", timeout=None, click=None):
-    command = ["omarchy-notification-send", "-u", urgency, "-g", GLYPH]
+def notify(headline: str, body: str = "", urgency: str = "low", timeout=None, click=None, want_id: bool = False):
+    """Fire a toast. With `want_id`, wait for its id so it can be withdrawn.
+
+    Waiting costs a D-Bus round trip, so only the notifications that can go
+    stale ask for it: an offer to record a call is a lie the moment the call
+    ends, and leaving it up for its full two minutes is worse than never
+    having shown it.
+    """
+    options = ["-u", urgency, "-g", GLYPH]
     if timeout:
-        command += ["-t", str(int(timeout))]
-    command += [headline, body]
+        options += ["-t", str(int(timeout))]
+    if want_id:
+        options.append("-p")
+    command = ["omarchy-notification-send", *options, headline, body]
     if click:
         # --exec is last and takes the argv as separate words, by contract.
         command += ["--exec", *click]
     try:
-        subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except OSError as error:
+        if not want_id:
+            subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return None
+        done = subprocess.run(command, capture_output=True, text=True, timeout=5)
+        return int(done.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
         warn(f"notification failed: {error}")
+        return None
+
+
+def withdraw(notification_id) -> None:
+    """Take a toast off the screen. omarchy-notification-send only sends."""
+    if not notification_id:
+        return
+    try:
+        subprocess.Popen(
+            [
+                "busctl", "--user", "call",
+                "org.freedesktop.Notifications",
+                "/org/freedesktop/Notifications",
+                "org.freedesktop.Notifications",
+                "CloseNotification", "u", str(notification_id),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as error:
+        warn(f"cannot withdraw notification: {error}")
 
 
 class Session:
@@ -148,6 +182,7 @@ class Daemon:
         self.subscriber_buffer = b""
         self.in_meeting = False
         self.pending = None
+        self.pending_toast = None
         self.evaluate_at = None
         self.end_at = None
         self.repoll_at = None
@@ -274,6 +309,7 @@ class Daemon:
         # finding audio with nothing to say what it is.
         if self.session:
             self.stop_session()
+        self.clear_pending()
         if self.child:
             self.child.terminate()
         (self.run / "pid").unlink(missing_ok=True)
@@ -630,7 +666,7 @@ class Daemon:
             return
         if self.pending:
             offer = self.pending
-            self.pending = None
+            self.clear_pending()
             self.start_session(offer.get("title"), offer.get("app"), auto=True)
         else:
             self.start_session(None, None, auto=False)
@@ -725,9 +761,7 @@ class Daemon:
         self.end_at = None
         self.repoll_at = None
         self.in_meeting = False
-        if self.pending:
-            self.pending = None
-            self.write_state()
+        self.clear_pending()
         if not proc:
             return
         try:
@@ -776,6 +810,20 @@ class Daemon:
         proc.wait(timeout=2)
         warn("pactl subscribe exited — will restart")
 
+    def clear_pending(self) -> None:
+        """Drop the offer and take its toast down with it.
+
+        The offer is only true while the other app still holds the microphone:
+        it ends when the call does, when the user accepts it, when detection is
+        turned off, and when the daemon stops.
+        """
+        withdraw(self.pending_toast)
+        self.pending_toast = None
+        if self.pending is None:
+            return
+        self.pending = None
+        self.write_state()
+
     def evaluate(self) -> None:
         self.evaluate_at = None
         settings = config.load()
@@ -787,9 +835,7 @@ class Daemon:
         now = time.monotonic()
         if not live:
             self.repoll_at = None
-            if self.pending:
-                self.pending = None
-                self.write_state()
+            self.clear_pending()
             if self.in_meeting and self.end_at is None:
                 self.end_at = now + DETECT_END_GRACE
             return
@@ -821,17 +867,18 @@ class Daemon:
             return
         self.pending = {"app": app, "title": title}
         self.write_state()
-        notify(
+        self.pending_toast = notify(
             f"{app} is in a call",
             f"{title or 'Record this meeting?'} · click to record",
             timeout=120000,
             click=[str(CLI), "record"],
+            want_id=True,
         )
 
     def end_meeting(self) -> None:
         self.end_at = None
         self.in_meeting = False
-        self.pending = None
+        self.clear_pending()
         warn("◇ call ended")
         # A hand-started recording outlives the call it happened to overlap.
         if self.session and self.session.auto:
