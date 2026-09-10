@@ -106,31 +106,15 @@ say "omayap.service enabled"
 if command -v voxtype >/dev/null 2>&1; then
   cat <<'VOXTYPE'
 
-voxtype is still on PATH, so Omarchy's own bindings hold F9 and SUPER + CTRL + X,
-and adding omayap on the same keys leaves both bound. Either take the keys off
-voxtype:
-
-  readlink /usr/bin/voxtype              # note where it points
-  sudo mv /usr/bin/voxtype /usr/bin/voxtype.disabled
-  systemctl --user disable --now voxtype.service
-
-which is reversible and uninstalls nothing, and then use the F9 bindings in the
-README. Or leave voxtype alone and give omayap a key of its own:
+voxtype is on PATH, so Omarchy's bindings already hold F9 and SUPER + CTRL + X,
+and a second bind on the same key does not replace the first. Give omayap a key
+of its own, then run `hyprctl reload`:
 
   o.bind("SUPER + CTRL + Y", "Toggle dictation", "~/.local/bin/omayap toggle", { release = true })
 
-The toggle is bound on release: a modifier you are still holding merges into
-every letter the transcript types, and SUPER + CTRL + <letter> is a menu
-shortcut in Omarchy.
-
-One toggle is enough to use omayap. Push-to-talk needs a key of its own, since
-it binds a press and a release, so add F10 only if you want to hold instead of
-toggle:
-
-  o.bind("F10", "Start dictation (push-to-talk)", "~/.local/bin/omayap press")
-  o.bind("F10", "Stop dictation (push-to-talk)", "~/.local/bin/omayap release", { release = true })
-
-Then run `hyprctl reload`.
+Bind on release: a modifier you are still holding merges into every letter the
+transcript types. Add F10 as well if you want push-to-talk, or run
+`omarchy-voxtype-remove` if you would rather have F9 back. See the README.
 VOXTYPE
 else
   cat <<'KEYS'

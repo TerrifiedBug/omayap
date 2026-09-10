@@ -25,11 +25,14 @@ level meter, a clock, and a stop button. Adapted from
 
 The model stays in memory, so a press costs a decode. On an Intel Core Ultra
 X7 358H, `omayap bench` on the model's own 7.4 s sample: p50 62 ms, 119x
-realtime. The daemon idles at about 240 MB.
+realtime. The daemon sits at about 240 MB of RSS, settling near 300 MB once
+the decoder's arena has grown, and a meeting transcription adds a second
+short-lived process of its own.
 
 ## Install
 
-Needs Omarchy 4.x, PipeWire, `python3`, and ~180 MB of disk. `pw-record`,
+Needs Omarchy 4.x, PipeWire, `python3`, and about 185 MB of disk for the venv
+and the models. `pw-record`,
 `wtype`, `wl-copy`, `pactl`, `pw-dump`, `hyprctl` and `setpriv` all ship with
 Omarchy.
 
@@ -62,25 +65,17 @@ o.bind("F10", "Stop dictation (push-to-talk)", "~/.local/bin/omayap release", { 
 If you run omakoe, remove it: `omarchy plugin remove io.github.ok.omakoe`. Its
 HUD is built in here.
 
-### voxtype holds F9 and SUPER + CTRL + X
+### voxtype already holds F9 and SUPER + CTRL + X
 
-Omarchy's `bindings/voxtype.lua` takes both while the `voxtype` binary is on
-`PATH`, and a second bind on the same key does not replace the first. Give
-omayap other keys, as above, or take voxtype's away:
+Omarchy's `bindings/voxtype.lua` takes both keys while the `voxtype` binary is
+on `PATH`, and a second bind on the same key does not replace the first, so
+give omayap a key of its own as above. Both systems then work and you pick
+which key you reach for.
 
-```bash
-readlink /usr/bin/voxtype            # note where it points
-pacman -Qo /usr/bin/voxtype          # who owns it, if anyone
-sudo mv /usr/bin/voxtype /usr/bin/voxtype.disabled
-systemctl --user disable --now voxtype.service
-hyprctl reload
-```
-
-Moving it keeps whatever it pointed at, so the rollback is a move back and
-nothing is uninstalled. `systemctl disable` alone is not enough: the keys stay
-bound to a daemon that is no longer listening. A `voxtype-bin` update recreates
-the file and the binds come back with it. `omarchy-voxtype-remove` is the
-permanent version, and it also deletes voxtype's config and models.
+If you would rather have F9 back, `omarchy-voxtype-remove` is Omarchy's own
+command for it. That uninstalls voxtype along with its config and models, so it
+is a decision rather than a step in an install. Disabling `voxtype.service`
+does not free the keys: the bindings only disappear with the binary.
 
 ## Settings
 
@@ -143,8 +138,9 @@ starts an interpreter, and the QML side reads one state file in
 
 ## What is stored, and where
 
-Runs as you, in your user session: no `sudo`, no `pkexec`, no setuid. One user
-service, stopped with your graphical session. No network at runtime.
+Runs as you, in your user session. Nothing in this plugin asks for `sudo`, and
+neither `setup.sh` nor `uninstall.sh` writes outside your home directory. One
+user service, stopped with your graphical session. No network at runtime.
 
 | What | Where | Contains |
 | --- | --- | --- |
@@ -181,8 +177,7 @@ Before `omarchy plugin remove`, while the scripts are still on disk:
 
 ```bash
 cd ~/.config/omarchy/plugins/io.github.terrifiedbug.omayap
-./uninstall.sh --restore-voxtype   # only if you disabled voxtype
-./uninstall.sh                     # add --purge to delete the venv and models
+./uninstall.sh    # add --purge to delete the venv and the models too
 cd ~ && omarchy plugin remove io.github.terrifiedbug.omayap
 ```
 
