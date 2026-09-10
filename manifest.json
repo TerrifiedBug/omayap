@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.terrifiedbug.omayap",
+  "name": "OmaYap",
+  "version": "0.1.0",
+  "author": "TerrifiedBug",
+  "license": "MIT",
+  "description": "Hold a key, talk, let go: on-device dictation and a two-track meeting recorder with transcripts.",
+  "homepage": "https://github.com/TerrifiedBug/omayap",
+  "kinds": [
+    "bar-widget",
+    "overlay",
+    "service"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "overlay": "Hud.qml",
+    "service": "Service.qml"
+  },
+  "keepLoaded": true,
+  "barWidget": {
+    "displayName": "OmaYap",
+    "description": "Dictation and meeting recorder",
+    "category": "Audio",
+    "defaultSection": "right",
+    "defaults": {},
+    "schema": []
+  }
+}

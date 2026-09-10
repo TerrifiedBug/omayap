@@ -1,0 +1,40 @@
+#!/bin/bash
+# The omayap client: signals for the hot path, the venv for everything else.
+#
+# Holding F9 has to feel instant, and starting a Python interpreter to say
+# "the user pressed a key" does not. press/release/toggle/record are one
+# signal to a daemon that already has the model in memory; everything else is
+# rare enough to pay for an interpreter.
+
+set -euo pipefail
+
+here=$(dirname "$(readlink -f "$0")")
+run=${XDG_RUNTIME_DIR:-/run/user/$UID}/omayap
+
+sig() {
+  local pid
+  pid=$(cat "$run/pid" 2>/dev/null) || pid=""
+  if [[ -z $pid ]] || ! kill -s "$1" "$pid" 2>/dev/null; then
+    omarchy-notification-send -u critical "omayap" "daemon is not running"
+    exit 1
+  fi
+}
+
+case "${1:-}" in
+press) sig USR1 ;;
+release) sig USR2 ;;
+toggle) sig RTMIN ;;
+# Start a meeting recording, or stop the one that is running.
+record) sig RTMIN+1 ;;
+status) cat "$run/state" ;;
+levels)
+  # The daemon only writes levels while something is reading them, so the HUD
+  # opening this FIFO is what turns the stream on.
+  if [[ ! -p $run/levels ]]; then
+    mkdir -p "$run"
+    mkfifo -m 600 "$run/levels" 2>/dev/null || true
+  fi
+  exec cat "$run/levels"
+  ;;
+*) exec env PYTHONPATH="$here/.." "$HOME/.local/share/omayap/venv/bin/python" -m omayap "$@" ;;
+esac

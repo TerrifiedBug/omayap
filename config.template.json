@@ -1,0 +1,8 @@
+{
+  "recordings_dir": "~/Recordings",
+  "keep_audio": true,
+  "newline_after_dictation": false,
+  "meeting_detection": false,
+  "meeting_auto_record": false,
+  "meeting_excluded_apps": []
+}

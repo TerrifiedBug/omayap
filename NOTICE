@@ -1,0 +1,9 @@
+OmaYap
+Copyright (c) 2026 TerrifiedBug
+
+Hud.qml, PixelMorph.qml, Scanner.qml and HudModel.js are adapted from omakoe,
+copyright (c) 2026 Oliver Kohl, MIT (https://github.com/ok/omakoe).
+
+Speech recognition uses sherpa-onnx (https://github.com/k2-fsa/sherpa-onnx,
+Apache-2.0) with the Parakeet TDT CTC 110M and Silero VAD models it publishes.
+Those model files are downloaded by setup.sh and are not part of this repo.
