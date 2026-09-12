@@ -100,11 +100,12 @@ class TestStampOf(unittest.TestCase):
 class TestSessionDir(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
+        self.root = session.open_root(self.tmp.name)
         # Naive, so it is local time: the stamp is local by contract.
         self.started = datetime(2026, 1, 2, 9, 30).astimezone()
 
     def tearDown(self):
+        self.root.close()
         self.tmp.cleanup()
 
     def test_bare_and_titled_names(self):
@@ -128,11 +129,13 @@ class TestSessionDir(unittest.TestCase):
 class TestWrittenFiles(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.dir = Path(self.tmp.name)
+        self.path = Path(self.tmp.name)
+        self.dir = session.open_root(self.tmp.name)
         self.started = datetime(2026, 1, 2, 9, 30, 0, tzinfo=timezone.utc)
         self.ended = datetime(2026, 1, 2, 9, 30, 28, tzinfo=timezone.utc)
 
     def tearDown(self):
+        self.dir.close()
         self.tmp.cleanup()
 
     def test_markdown_matches_the_vault(self):
@@ -144,7 +147,7 @@ class TestWrittenFiles(unittest.TestCase):
         session.write_meta(
             self.dir, self.started, self.ended, {"mic": 1500, "system": 0}
         )
-        raw = (self.dir / "meta.json").read_text(encoding="utf-8")
+        raw = (self.path / "meta.json").read_text(encoding="utf-8")
         meta = json.loads(raw)
         self.assertEqual(
             list(meta),
@@ -156,6 +159,11 @@ class TestWrittenFiles(unittest.TestCase):
         self.assertEqual(meta["files"], {"mic": "mic.f32", "system": "system.f32"})
         self.assertEqual(meta["start_offset_ms"], {"mic": 1500, "system": 0})
         self.assertTrue(raw.endswith("\n"))
+
+    def test_written_files_are_private(self):
+        session.write_meta(self.dir, self.started, self.ended, {})
+        mode = (self.path / "meta.json").stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600, "a transcript is nobody else's business")
 
     def test_app_and_title_appear_only_when_there_is_one(self):
         meta = session.write_meta(
@@ -169,7 +177,7 @@ class TestWrittenFiles(unittest.TestCase):
         self.assertEqual(meta["app"], "teams")
         self.assertEqual(meta["title"], "Weekly Sync")
         self.assertEqual(
-            list(json.loads((self.dir / "meta.json").read_text(encoding="utf-8"))),
+            list(json.loads((self.path / "meta.json").read_text(encoding="utf-8"))),
             [
                 "app",
                 "duration_seconds",
@@ -182,28 +190,36 @@ class TestWrittenFiles(unittest.TestCase):
         )
 
     def test_transcript_is_sorted_and_named_after_its_directory(self):
-        target = self.dir / GOLDEN_NAME
-        target.mkdir()
+        target = self.dir.child(GOLDEN_NAME, create=True)
+        self.addCleanup(target.close)
         shuffled = [GOLDEN_SEGMENTS[3], GOLDEN_SEGMENTS[0], GOLDEN_SEGMENTS[2], GOLDEN_SEGMENTS[1]]
         session.write_transcript(target, shuffled)
+        written = self.path / GOLDEN_NAME
         self.assertEqual(
-            (target / "transcript.md").read_text(encoding="utf-8"), GOLDEN_MARKDOWN
+            (written / "transcript.md").read_text(encoding="utf-8"), GOLDEN_MARKDOWN
         )
-        data = json.loads((target / "transcript.json").read_text(encoding="utf-8"))
+        data = json.loads((written / "transcript.json").read_text(encoding="utf-8"))
         self.assertEqual(list(data), ["created_at", "engine", "model", "segments"])
         self.assertEqual(data["engine"], "parakeet")
         self.assertEqual(data["model"], "parakeet-tdt-ctc-110m")
         self.assertEqual([seg["start_ms"] for seg in data["segments"]], [2000, 7000, 10000, 27000])
 
     def test_pending_is_meta_without_a_transcript(self):
-        done = self.dir / "2026.01.02-0900"
-        waiting = self.dir / "2026.01.02-1000"
+        done = self.path / "2026.01.02-0900"
+        waiting = self.path / "2026.01.02-1000"
         for path in (done, waiting):
             path.mkdir()
             (path / "meta.json").write_text("{}", encoding="utf-8")
         (done / "transcript.json").write_text("{}", encoding="utf-8")
-        (self.dir / "not-a-session").mkdir()
-        self.assertEqual(session.pending(self.dir), [waiting])
+        (self.path / "not-a-session").mkdir()
+        self.assertEqual(session.pending(self.dir), ["2026.01.02-1000"])
+
+    def test_a_session_directory_is_not_followed_into_a_symlink(self):
+        elsewhere = self.path / "elsewhere"
+        elsewhere.mkdir()
+        (self.path / "link").symlink_to(elsewhere)
+        with self.assertRaises(OSError):
+            session.open_root(self.path / "link")
 
 
 if __name__ == "__main__":

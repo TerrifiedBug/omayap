@@ -42,7 +42,8 @@ omarchy plugin add https://github.com/TerrifiedBug/omayap.git --enable
 ```
 
 `omarchy plugin add` only clones the repo, so `setup.sh` is yours to run. It
-builds a venv, downloads the Parakeet and Silero models against pinned SHA-256
+builds a venv, installs sherpa-onnx from `requirements.lock` with pinned
+SHA-256 hashes, downloads the Parakeet and Silero models against pinned
 checksums, writes `~/.config/omayap/config.json`, links `~/.local/bin/omayap`,
 and enables `omayap.service` for your graphical session.
 
@@ -124,7 +125,7 @@ UTC, the duration, and how far apart the two tracks started.
 
 ```bash
 omayap toggle         # start dictating, or stop and transcribe
-omayap press          # push-to-talk down (one signal, no Python)
+omayap press          # push-to-talk down (one write, no Python)
 omayap release        # push-to-talk up
 omayap record         # start a meeting recording, or stop the running one
 omayap status         # the daemon's state, as JSON
@@ -132,9 +133,10 @@ omayap config KEY VAL # write one setting
 omayap bench FILE.wav # time the model on 16 kHz mono audio
 ```
 
-The daemon has no socket. Everything arrives as a signal, so the hot path never
-starts an interpreter, and the QML side reads one state file in
-`$XDG_RUNTIME_DIR/omayap/` and runs the same CLI the keys do.
+The daemon has no socket. Commands are one word written into a FIFO it creates
+in `$XDG_RUNTIME_DIR/omayap/`, so the hot path never starts an interpreter. The
+QML side reads one state file in the same directory and runs the same CLI the
+keys do.
 
 ## What is stored, and where
 
@@ -152,6 +154,46 @@ user service, stopped with your graphical session. No network at runtime.
 | Live state | `$XDG_RUNTIME_DIR/omayap/state` | the current session's path, until reboot |
 
 Notifications show a meeting title while a call is being offered or recorded.
+
+## How it runs things
+
+Every program omayap starts is listed by absolute path in `omayap/proc.py` and
+re-checked on each run: root-owned, not writable by anyone else, and with no
+group- or world-writable directory above it. PATH has no say in what gets
+executed. Each child gets an environment built from a short allowlist rather
+than a copy of yours, and a session of its own so it can be stopped as a group.
+
+The ones omayap waits on (`hyprctl`, `pw-dump`, `wtype`, the notification
+sender) have a deadline and a limit on how much they can print, so a wedged or
+endlessly chatty helper cannot stall the dictation key. The ones that stream
+(`pw-record`, `pactl subscribe`) run until omayap stops them, and stopping
+means signalling the whole process group and killing it if it ignores that.
+Their last read before stopping has its own deadline, so a helper that never
+closes its pipe cannot hold the daemon either. A transcription child is
+allowed four times the length of the recording it is decoding before it is
+killed and the session is reported as failed.
+
+Files are opened relative to a directory omayap already checked, with
+`O_NOFOLLOW` on the last component, so a symlink dropped in where a file
+should be is an error rather than a redirect. Its own directories
+(`~/.config/omayap`, `$XDG_RUNTIME_DIR/omayap`, and each session directory) are
+0700, and it tightens them if it finds them looser. A symlink anywhere on the
+way to your recordings directory is refused, so point `recordings_dir` at the
+real path if you keep recordings on another disk.
+
+Commands reach the daemon through a pipe it made itself, inside a directory
+only you can enter, so a write can only land on the daemon holding the other
+end. Nothing is signalled at a pid. The pid file is still there, and `omayap
+press` reads it, but only to decide whether to tell you the daemon is not
+running: a pid is a number the kernel reuses, and checking one before `kill`
+is never atomic, so nothing here depends on it. Two daemons cannot fight over
+the microphone either; the second one finds the lock taken and exits.
+
+One thing to know about the clipboard fallback: when nothing takes the typed
+transcript, omayap puts it on the clipboard with `wl-copy --foreground`, and on
+Wayland that process is the clipboard. It is held to the same rule as every
+other child and killed after five minutes, so the transcript stops being
+pastable then. The notification tells you.
 
 ## Troubleshooting
 

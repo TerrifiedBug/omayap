@@ -17,6 +17,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from . import safeio
+
 ENGINE = "parakeet"
 MODEL = "parakeet-tdt-ctc-110m"
 RATE = 16000
@@ -32,9 +34,13 @@ CONFIG_DIR = Path.home() / ".config" / "omayap"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 
-def run_dir() -> Path:
-    """The runtime directory, created 0700 on first use."""
+def run_dir() -> "safeio.Dir":
+    """The runtime directory, 0700, as an open descriptor.
+
+    A descriptor rather than a path because everything in here is signalled
+    on, watched, or replaced: the pid file decides who gets a SIGUSR1 and the
+    state file is what the bar reads. Resolving those names again on every
+    access is what lets something slip a symlink in between.
+    """
     base = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
-    path = Path(base) / "omayap"
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return path
+    return safeio.open_dir(Path(base) / "omayap", create=True)

@@ -9,13 +9,18 @@ from __future__ import annotations
 
 import os
 import selectors
+import stat
+import subprocess
 import sys
+import tempfile
+import time
 import unittest
+from collections import deque
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from omayap import MIN_SAMPLES, daemon  # noqa: E402
+from omayap import MIN_SAMPLES, daemon, safeio  # noqa: E402
 
 
 class FakeCapture:
@@ -125,6 +130,150 @@ class DictationCaptureLoss(unittest.TestCase):
         self.assertEqual(spoken, ["hello"])
         self.assertEqual(self.daemon.dictation, "idle")
         self.assertEqual(self.registered(), 0)
+
+
+class ControlPipe(unittest.TestCase):
+    """How a key press reaches the daemon: a word on a pipe it owns."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.run = safeio.open_dir(self.tmp.name)
+        self.addCleanup(self.run.close)
+        self.warnings: list = []
+        self.original = daemon.warn
+        daemon.warn = lambda message: self.warnings.append(message)
+        self.addCleanup(self.restore)
+
+        self.daemon = object.__new__(daemon.Daemon)
+        self.daemon.run = self.run
+        self.daemon.selector = selectors.DefaultSelector()
+        self.addCleanup(self.daemon.selector.close)
+        self.daemon.control_fd = None
+        self.daemon.control_buffer = b""
+        self.done: list = []
+        for name in ("press", "release", "toggle_dictation", "toggle_recording"):
+            setattr(self.daemon, name, lambda name=name: self.done.append(name))
+        self.daemon.open_control()
+        self.addCleanup(os.close, self.daemon.control_fd)
+
+    def restore(self):
+        daemon.warn = self.original
+
+    def write(self, text: str) -> None:
+        fd = os.open(os.path.join(self.tmp.name, "control"), os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            os.write(fd, text.encode())
+        finally:
+            os.close(fd)
+        self.daemon.on_control()
+
+    def test_the_pipe_is_private_to_this_user(self):
+        info = self.run.stat("control")
+        self.assertTrue(stat.S_ISFIFO(info.st_mode))
+        self.assertEqual(info.st_mode & 0o777, 0o600)
+
+    def test_every_command_reaches_its_handler(self):
+        self.write("press\nrelease\ntoggle\nrecord\n")
+        self.assertEqual(
+            self.done, ["press", "release", "toggle_dictation", "toggle_recording"]
+        )
+
+    def test_a_command_split_across_writes_still_arrives_once(self):
+        self.write("pre")
+        self.assertEqual(self.done, [], "half a word is not a command")
+        self.write("ss\n")
+        self.assertEqual(self.done, ["press"])
+
+    def test_rubbish_is_logged_and_ignored(self):
+        self.write("rm -rf /\n\n   \n")
+        self.assertEqual(self.done, [])
+        self.assertEqual(len(self.warnings), 1, "one line, one complaint")
+
+    def test_nothing_is_lost_when_the_client_opens_the_pipe_read_write(self):
+        # The client opens <> so the open cannot block when the daemon has
+        # gone. It never reads, so it cannot eat its own command, and this is
+        # the test that says so: two hundred presses, two hundred presses.
+        for _ in range(200):
+            fd = os.open(
+                os.path.join(self.tmp.name, "control"), os.O_RDWR | os.O_NONBLOCK
+            )
+            try:
+                os.write(fd, b"press\n")
+            finally:
+                os.close(fd)
+            self.daemon.on_control()
+        self.assertEqual(self.done, ["press"] * 200)
+
+    def test_a_command_left_from_a_dead_daemon_is_not_replayed(self):
+        # Nobody is reading, so the write goes nowhere the moment the writer
+        # closes: a FIFO is a buffer, not a mailbox.
+        self.daemon.selector.unregister(self.daemon.control_fd)
+        os.close(self.daemon.control_fd)
+        fd = os.open(os.path.join(self.tmp.name, "control"), os.O_RDWR | os.O_NONBLOCK)
+        os.write(fd, b"press\n")
+        os.close(fd)
+        self.daemon.control_fd = os.open(
+            os.path.join(self.tmp.name, "control"), os.O_RDWR | os.O_NONBLOCK
+        )
+        self.daemon.on_control()
+        self.assertEqual(self.done, [])
+
+    def test_the_pid_file_is_a_liveness_note_not_a_target(self):
+        self.daemon.write_pid()
+        pid, token = self.run.read_text("pid").split()
+        self.assertEqual(int(pid), os.getpid())
+        self.assertEqual(token, daemon.start_token(os.getpid()))
+        self.assertIsNone(daemon.start_token(2**30), "no such process, no token")
+
+
+class TranscriptionDeadline(unittest.TestCase):
+    """A decoder that wedges must not hold the queue for the whole session."""
+
+    def setUp(self):
+        self.notes: list = []
+        self.original = (daemon.notify, daemon.warn)
+        daemon.notify = lambda *args, **kw: self.notes.append(args)
+        daemon.warn = lambda message: None
+        self.addCleanup(self.restore)
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = safeio.open_dir(self.tmp.name)
+        self.addCleanup(self.dir.close)
+
+        self.daemon = object.__new__(daemon.Daemon)
+        self.daemon.queue = deque()
+        self.daemon.running = True
+        self.daemon.write_state = lambda: None
+
+    def restore(self):
+        daemon.notify, daemon.warn = self.original
+
+    def test_a_wedged_transcription_is_killed_and_reported(self):
+        child = subprocess.Popen(["/usr/bin/sleep", "30"], start_new_session=True)
+        self.addCleanup(child.wait)
+        self.daemon.child = child
+        self.daemon.child_dir = self.dir
+        self.daemon.child_at = time.monotonic() - 1
+
+        self.daemon.poll_child()
+
+        self.assertIsNone(self.daemon.child, "the wedged child is let go of")
+        self.assertEqual(child.poll(), -9, "and actually killed")
+        self.assertTrue(
+            any("failed" in str(note[0]) for note in self.notes),
+            "a transcription that had to be killed says so",
+        )
+
+    def test_the_deadline_follows_the_length_of_the_recording(self):
+        self.dir.write("meta.json", '{"duration_seconds": 3600}')
+        self.assertEqual(
+            self.daemon.child_deadline(self.dir), 3600 * daemon.TRANSCRIBE_FACTOR
+        )
+
+    def test_a_session_with_no_usable_meta_still_gets_a_deadline(self):
+        self.assertEqual(self.daemon.child_deadline(self.dir), daemon.TRANSCRIBE_FLOOR)
 
 
 if __name__ == "__main__":

@@ -1,40 +1,177 @@
 #!/bin/bash
-# The omayap client: signals for the hot path, the venv for everything else.
+# The omayap client: a word down a pipe for the hot path, the venv for
+# everything else.
 #
 # Holding F9 has to feel instant, and starting a Python interpreter to say
-# "the user pressed a key" does not. press/release/toggle/record are one
-# signal to a daemon that already has the model in memory; everything else is
-# rare enough to pay for an interpreter.
+# "the user pressed a key" does not. press/release/toggle/record are one write
+# into a FIFO that a daemon with the model already in memory is reading;
+# everything else is rare enough to pay for an interpreter.
+#
+# The FIFO is what makes this safe as well as fast. It is created by the
+# daemon that holds the lock, inside a 0700 runtime directory, and a write to
+# it can only reach that daemon. Signalling a pid read out of a file cannot
+# say the same: a pid is a number the kernel reuses, and no amount of checking
+# one before `kill` makes the pair of operations atomic.
+#
+# The pid file is still read here, but only to decide whether to tell you the
+# daemon is not running. Nothing is signalled on the strength of it.
 
 set -euo pipefail
 
-here=$(dirname "$(readlink -f "$0")")
-run=${XDG_RUNTIME_DIR:-/run/user/$UID}/omayap
+# Nothing here is looked up on PATH, and nothing a caller exports can redirect
+# an interpreter or a loader. A dictation key is an easy thing to point at
+# something else.
+PATH=/usr/bin:/bin
+export PATH
+unset CDPATH BASH_ENV ENV LD_PRELOAD LD_LIBRARY_PATH PYTHONHOME PYTHONSTARTUP
+IFS=$' \t\n'
 
-sig() {
-  local pid
-  pid=$(cat "$run/pid" 2>/dev/null) || pid=""
-  if [[ -z $pid ]] || ! kill -s "$1" "$pid" 2>/dev/null; then
-    omarchy-notification-send -u critical "omayap" "daemon is not running"
-    exit 1
-  fi
+here=$(/usr/bin/dirname "$(/usr/bin/readlink -f "$0")")
+run=${XDG_RUNTIME_DIR:-/run/user/$UID}/omayap
+python=$HOME/.local/share/omayap/venv/bin/python
+
+# The environment every child of this script gets: built, not inherited.
+# /usr/share/omarchy/bin is on it because omarchy-notification-send calls
+# omarchy-glyph and omarchy-action by name.
+closed_env=(
+  /usr/bin/env -i
+  PATH=/usr/bin:/bin:/usr/share/omarchy/bin
+  HOME="$HOME"
+  USER="${USER-}"
+  LANG="${LANG-}"
+  XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR-}"
+  XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP-}"
+  WAYLAND_DISPLAY="${WAYLAND_DISPLAY-}"
+  DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS-}"
+  HYPRLAND_INSTANCE_SIGNATURE="${HYPRLAND_INSTANCE_SIGNATURE-}"
+)
+
+fail() {
+  local sender
+  for sender in /usr/share/omarchy/bin/omarchy-notification-send \
+    /usr/local/share/omarchy/bin/omarchy-notification-send; do
+    if [[ -x $sender ]]; then
+      "${closed_env[@]}" "$sender" -u critical "omayap" "$1" || true
+      exit 1
+    fi
+  done
+  printf 'omayap: %s\n' "$1" >&2
+  exit 1
+}
+
+# The runtime directory has to be a directory, ours, not a link to one, and
+# 0700. The mode matters as much as the owner: a group-writable runtime
+# directory means somebody else can put a pid file in it, and this script
+# signals what the pid file says.
+guard() {
+  local mode
+  [[ -d $run && ! -L $run && -O $run ]] ||
+    fail "runtime directory is missing or not yours"
+  mode=$(/usr/bin/stat -Lc '%a' "$run") ||
+    fail "cannot read the runtime directory"
+  [[ $mode == 700 ]] || fail "runtime directory is $mode, not 700"
+}
+
+# Field 22 of /proc/<pid>/stat: the process's start time in clock ticks. Read
+# with the shell alone, because this is the hot path. comm is field 2 and the
+# only one that can contain spaces or brackets, so everything up to the last
+# bracket goes first.
+start_token() {
+  local line rest
+  read -r line <"/proc/$1/stat" 2>/dev/null || return 1
+  rest=${line##*") "}
+  # shellcheck disable=SC2086 # deliberate: /proc/pid/stat is space-separated
+  set -- $rest
+  [[ $# -ge 20 ]] || return 1
+  printf '%s\n' "${20}"
+}
+
+# Is that pid an omayap daemon? The start time says the pid is the process
+# that wrote the pid file; this says the process is what the file claims:
+# `-m omayap daemon` as three consecutive arguments, running the interpreter
+# this install uses. -ef compares device and inode, so it costs no fork and
+# still sees through both symlinks.
+is_omayap() {
+  local argv=() index
+  mapfile -d '' -t argv <"/proc/$1/cmdline" 2>/dev/null || return 1
+  for ((index = 0; index + 2 < ${#argv[@]}; index++)); do
+    [[ ${argv[index]} == -m && ${argv[index + 1]} == omayap &&
+      ${argv[index + 2]} == daemon ]] || continue
+    [[ /proc/$1/exe -ef $python ]] && return 0
+  done
+  return 1
+}
+
+# Is a daemon there at all? Only ever used to choose between sending the
+# command and telling the user nothing is listening. Worst case this is wrong
+# about a process that has just exited, and the cost of that is one word
+# written into a pipe with nobody at the other end, which the kernel discards
+# when this script exits.
+running() {
+  local pid token live
+  [[ -f $run/pid && ! -L $run/pid && -O $run/pid ]] || return 1
+  read -r pid token <"$run/pid" || return 1
+  [[ $pid =~ ^[0-9]+$ && $token =~ ^[0-9]+$ ]] || return 1
+  [[ -O /proc/$pid ]] || return 1
+  live=$(start_token "$pid") || return 1
+  [[ $live == "$token" ]] || return 1
+  is_omayap "$pid"
+}
+
+# One word, one line, well under PIPE_BUF, so the daemon never reads half a
+# command. The pipe is opened read-write: write-only would block forever if
+# the daemon went away between the check above and this line.
+send() {
+  local fd
+  guard
+  [[ -p $run/control && ! -L $run/control && -O $run/control ]] ||
+    fail "daemon is not running"
+  running || fail "daemon is not running"
+  exec {fd}<>"$run/control" || fail "cannot reach the daemon"
+  printf '%s\n' "$1" >&"$fd" || fail "cannot reach the daemon"
+  exec {fd}>&-
 }
 
 case "${1:-}" in
-press) sig USR1 ;;
-release) sig USR2 ;;
-toggle) sig RTMIN ;;
+press) send press ;;
+release) send release ;;
+toggle) send toggle ;;
 # Start a meeting recording, or stop the one that is running.
-record) sig RTMIN+1 ;;
-status) cat "$run/state" ;;
+record) send record ;;
+status)
+  guard
+  [[ -f $run/state && ! -L $run/state && -O $run/state ]] ||
+    fail "daemon is not running"
+  exec /usr/bin/cat "$run/state"
+  ;;
 levels)
   # The daemon only writes levels while something is reading them, so the HUD
   # opening this FIFO is what turns the stream on.
+  guard
   if [[ ! -p $run/levels ]]; then
-    mkdir -p "$run"
-    mkfifo -m 600 "$run/levels" 2>/dev/null || true
+    [[ -e $run/levels || -L $run/levels ]] && fail "$run/levels is not a pipe"
+    /usr/bin/mkfifo -m 600 "$run/levels" 2>/dev/null || true
   fi
-  exec cat "$run/levels"
+  [[ -p $run/levels && ! -L $run/levels && -O $run/levels ]] ||
+    fail "$run/levels is not the daemon's pipe"
+  exec /usr/bin/cat "$run/levels"
   ;;
-*) exec env PYTHONPATH="$here/.." "$HOME/.local/share/omayap/venv/bin/python" -m omayap "$@" ;;
+*)
+  # The venv's bin/python is a symlink to the system interpreter, as every
+  # venv's is, and it has to stay the thing that gets executed: exec the real
+  # interpreter instead and Python looks for pyvenv.cfg beside the wrong
+  # binary, finds no venv, and cannot import sherpa_onnx. So the link is what
+  # runs, and what gets checked is where it points.
+  target=$(/usr/bin/readlink -f "$python" 2>/dev/null) ||
+    fail "the omayap venv is missing — run setup.sh"
+  [[ -f $target && -x $target ]] ||
+    fail "the omayap venv is missing — run setup.sh"
+  read -r owner mode < <(/usr/bin/stat -Lc '%u %a' "$target")
+  [[ $owner == 0 || $owner == "$UID" ]] ||
+    fail "the interpreter behind $python belongs to uid $owner"
+  [[ ${mode: -2:1} == [0145] && ${mode: -1} == [0145] ]] ||
+    fail "the interpreter behind $python is writable by group or world"
+  [[ -O ${python%/*} ]] || fail "the omayap venv is not yours"
+  exec "${closed_env[@]}" PYTHONPATH="$here/.." "$python" -m omayap "$@"
+  ;;
 esac

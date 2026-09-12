@@ -14,11 +14,9 @@ or a conversion.
 from __future__ import annotations
 
 import array
-from pathlib import Path
-
 import sherpa_onnx
 
-from . import MIN_SAMPLES, MODEL, MODELS, RATE
+from . import MODEL, MODELS, RATE
 
 NUM_THREADS = 4
 MODEL_DIR = MODELS / MODEL
@@ -76,11 +74,15 @@ def vad():
     return sherpa_onnx.VoiceActivityDetector(config, buffer_size_in_seconds=VAD_BUFFER_S)
 
 
-def segments(engine: Engine, detector, path: Path, speaker: str, offset_ms: int = 0):
+def segments(engine: Engine, detector, handle, speaker: str, offset_ms: int = 0):
     """Cut one track into speech segments and decode each of them.
 
     Streamed rather than loaded: a two-hour meeting is 460 MB per track, and
     the VAD only ever holds the last minute of it.
+
+    The track arrives already open, because the caller reached it through a
+    descriptor on the session directory and opening it again by name here would
+    throw that away.
 
     `offset_ms` is the track's own start relative to the session's, so both
     tracks land on one timeline.
@@ -104,15 +106,14 @@ def segments(engine: Engine, detector, path: Path, speaker: str, offset_ms: int 
                     }
                 )
 
-    with open(path, "rb") as handle:
-        while True:
-            chunk = handle.read(WINDOW * 4)
-            if len(chunk) < WINDOW * 4:
-                break
-            window = array.array("f")
-            window.frombytes(chunk)
-            detector.accept_waveform(window)
-            drain()
+    while True:
+        chunk = handle.read(WINDOW * 4)
+        if len(chunk) < WINDOW * 4:
+            break
+        window = array.array("f")
+        window.frombytes(chunk)
+        detector.accept_waveform(window)
+        drain()
 
     # Speech still open at the end of the file is a segment too — usually the
     # last thing anyone said.

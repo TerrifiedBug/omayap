@@ -13,9 +13,12 @@ from __future__ import annotations
 import array
 import json
 import os
+import select
+import signal
 import subprocess
+import time
 
-from . import RATE
+from . import RATE, proc as runner
 
 # 20 ms, so a level frame on the HUD is current rather than a fifth of a second
 # old.
@@ -34,11 +37,21 @@ SYSTEM = {"node.name": "omayap-system", "stream.capture.sink": True}
 BYTES_PER_SAMPLE = 4
 CHUNK = 1 << 16
 
+# The last read after a capture is asked to stop. pw-record flushes a fraction
+# of a second; a descendant holding the pipe open flushes nothing, forever, so
+# the drain runs against a clock and a ceiling instead of against EOF.
+DRAIN_S = 2.0
+DRAIN_MAX = 16 << 20
+
 
 def record(props: dict, target: str | None = None) -> subprocess.Popen:
-    """Start a capture. Its stdout is a non-blocking pipe of f32 samples."""
+    """Start a capture. Its stdout is a non-blocking pipe of f32 samples.
+
+    pw-record is resolved and checked on every start rather than found on
+    PATH, and gets a session of its own so stopping it cannot leave anything
+    behind.
+    """
     command = [
-        "pw-record",
         "--raw",
         "--format=f32",
         f"--rate={RATE}",
@@ -50,11 +63,9 @@ def record(props: dict, target: str | None = None) -> subprocess.Popen:
     if target:
         command.append(f"--target={target}")
     command.append("-")
-    proc = subprocess.Popen(
-        command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0
-    )
-    os.set_blocking(proc.stdout.fileno(), False)
-    return proc
+    process = runner.spawn("pw-record", command, bufsize=0)
+    os.set_blocking(process.stdout.fileno(), False)
+    return process
 
 
 def read(proc: subprocess.Popen) -> bytes | None:
@@ -68,29 +79,40 @@ def read(proc: subprocess.Popen) -> bytes | None:
 
 
 def stop(proc: subprocess.Popen) -> bytes:
-    """Terminate a capture and return whatever was still in the pipe."""
+    """Terminate a capture and return whatever was still in the pipe.
+
+    The pipe stays non-blocking and the drain has a deadline: the last word on
+    when this returns belongs to this process, not to whatever is holding the
+    write end. A recording that loses its final 20 ms is a recording; a daemon
+    blocked on a read is a dictation key that stops working.
+    """
     if proc.poll() is None:
-        proc.terminate()
+        runner.signal_tree(proc, signal.SIGTERM)
     fd = proc.stdout.fileno()
     rest = bytearray()
-    try:
-        os.set_blocking(fd, True)
-        while True:
+    deadline = time.monotonic() + DRAIN_S
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)
+    while len(rest) < DRAIN_MAX:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        if not poller.poll(left * 1000):
+            break
+        try:
             chunk = os.read(fd, CHUNK)
-            if not chunk:
-                break
-            rest += chunk
-    except OSError:
-        pass
+        except BlockingIOError:
+            continue
+        except OSError:
+            break
+        if not chunk:
+            break
+        rest += chunk
     try:
         proc.stdout.close()
     except OSError:
         pass
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=2)
+    runner.stop(proc, grace=5.0)
     return bytes(rest)
 
 

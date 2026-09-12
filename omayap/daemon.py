@@ -25,7 +25,6 @@ import json
 import os
 import selectors
 import signal
-import subprocess
 import sys
 import time
 from collections import deque
@@ -33,13 +32,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import MIN_SAMPLES, capture, config, detect, run_dir
+from . import proc as runner
 from . import session as vault
 
-# The client protocol, in full.
-PRESS = signal.SIGUSR1
-RELEASE = signal.SIGUSR2
-TOGGLE_DICTATION = signal.SIGRTMIN
-TOGGLE_RECORDING = signal.SIGRTMIN + 1
+# The client protocol, in full: one word per line, written into the control
+# pipe. Anything else in there is ignored and logged.
+COMMANDS = {
+    "press": lambda self: self.press(),
+    "release": lambda self: self.release(),
+    "toggle": lambda self: self.toggle_dictation(),
+    "record": lambda self: self.toggle_recording(),
+}
 
 GLYPH = "󰍬"  # nf-md-microphone
 
@@ -71,6 +74,27 @@ OFFER_TOAST_MS = 10000
 # few seconds costs about 30 ms and only happens while the toast is up.
 PENDING_POLL = 3.0
 
+# Deadlines for the programs that put a transcript on screen. wtype types a
+# character at a time through a virtual keyboard, so a long transcript is
+# genuinely slow; anything past this is wedged rather than busy, and the daemon
+# has a hotkey to answer.
+TYPE_DEADLINE = 30.0
+CLIP_DEADLINE = 5.0
+
+# How long the clipboard fallback keeps a transcript pastable. wl-copy in the
+# foreground is a process like any other here, so it gets a deadline like any
+# other; five minutes is long enough to switch windows and paste, short enough
+# that a stray transcript is not sitting in the clipboard at the end of the
+# day.
+CLIPBOARD_HOLD = 300.0
+
+# A transcription is bounded by the recording it is transcribing: the model
+# runs at about fifty times real time, so four times the audio is the line
+# between a slow machine and a stuck child. The floor covers short recordings,
+# where loading the model is most of the work.
+TRANSCRIBE_FACTOR = 4.0
+TRANSCRIBE_FLOOR = 300.0
+
 CLI = Path(__file__).resolve().parent.parent / "bin" / "omayap"
 
 
@@ -86,6 +110,23 @@ def trim_heap() -> None:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except (OSError, AttributeError):
         pass
+
+
+def start_token(pid: int) -> str | None:
+    """A process's start time, in clock ticks since boot.
+
+    Goes in the pid file so the client can tell a live daemon from a number
+    left over by a crash, which is the difference between "not running" and a
+    confusing silence. Nothing is signalled on the strength of it. Field 22 of
+    /proc/<pid>/stat, counted after the comm field, which is the one field that
+    can contain spaces and brackets.
+    """
+    try:
+        with open(f"/proc/{int(pid)}/stat", "rb") as handle:
+            fields = handle.read().rpartition(b")")[2].split()
+        return fields[19].decode("ascii")
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def warn(message: str) -> None:
@@ -112,17 +153,18 @@ def notify(headline: str, body: str = "", urgency: str = "low", timeout=None, cl
         options += ["-t", str(int(timeout))]
     if want_id:
         options.append("-p")
-    command = ["omarchy-notification-send", *options, headline, body]
+    command = [*options, headline, body]
     if click:
         # --exec is last and takes the argv as separate words, by contract.
         command += ["--exec", *click]
     try:
         if not want_id:
-            subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Nobody waits for this one, so it is held to a deadline instead.
+            runner.background("omarchy-notification-send", command)
             return None
-        done = subprocess.run(command, capture_output=True, text=True, timeout=5)
-        return int(done.stdout.strip())
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        done = runner.run("omarchy-notification-send", command, timeout=5.0, limit=4096)
+        return int(done.out.decode("utf-8", "replace").strip())
+    except (OSError, ValueError) as error:
         warn(f"notification failed: {error}")
         return None
 
@@ -140,16 +182,15 @@ def withdraw(notification_id) -> None:
     if not notification_id:
         return
     try:
-        subprocess.Popen(
+        runner.background(
+            "busctl",
             [
-                "busctl", "--user", "call",
+                "--user", "call",
                 "org.freedesktop.Notifications",
                 "/org/freedesktop/Notifications",
                 "org.freedesktop.Notifications",
                 "CloseNotification", "u", str(notification_id),
             ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
         )
     except OSError as error:
         warn(f"cannot withdraw notification: {error}")
@@ -158,7 +199,10 @@ def withdraw(notification_id) -> None:
 class Session:
     """One meeting recording: two captures writing two files."""
 
-    def __init__(self, directory: Path, started: datetime, title, app, auto: bool):
+    def __init__(self, root, directory, started: datetime, title, app, auto: bool):
+        # The tree the session lives in, kept open because abandoning a failed
+        # recording means removing a directory from inside it.
+        self.root = root
         self.dir = directory
         self.started = started
         self.title = title
@@ -182,6 +226,8 @@ class Daemon:
         self.running = True
         self.lock_fd = None
         self.signal_fd = None
+        self.control_fd = None
+        self.control_buffer = b""
 
         self.engine = None
         self.model = "loading"
@@ -199,6 +245,7 @@ class Daemon:
         self.queue: deque = deque()
         self.child = None
         self.child_dir = None
+        self.child_at = 0.0
 
         self.subscriber = None
         self.subscriber_buffer = b""
@@ -214,8 +261,12 @@ class Daemon:
 
     def main(self) -> int:
         if not self.lock():
-            return 1
-        (self.run / "pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+            # Not a failure: another daemon owns the hotkey, and two of them
+            # would fight over the microphone. Exit cleanly so the service
+            # manager does not restart this one in a loop.
+            return 0
+        self.open_control()
+        self.write_pid()
         # Handlers first: a signal that arrives while the model is loading has
         # to be a "still loading" toast, not a default-action kill.
         self.install_signals()
@@ -246,24 +297,17 @@ class Daemon:
         return 0
 
     def lock(self) -> bool:
-        """One daemon owns the hotkey. A stale one is replaced, not tolerated."""
-        fd = os.open(str(self.run / "daemon.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+        """One daemon owns the hotkey, and it is whoever got here first.
+
+        The lock lives on a descriptor, so it is released by the kernel when
+        that process dies however it dies. If it cannot be taken, a daemon is
+        running: not a stale file, not a recycled pid, an actual live process.
+        There is nothing to verify and nothing to kill.
+        """
+        fd = self.run.open("daemon.lock", os.O_CREAT | os.O_RDWR)
         if self.take(fd):
             return True
-        other = self.other_pid()
-        warn(f"another omayap daemon has the hotkey (pid {other}) — replacing it")
-        if not other:
-            return False
-        for sig, tries in ((signal.SIGTERM, 100), (signal.SIGKILL, 20)):
-            try:
-                os.kill(other, sig)
-            except OSError:
-                pass
-            for _ in range(tries):
-                time.sleep(0.05)
-                if self.take(fd):
-                    return True
-        warn(f"pid {other} will not release the lock — giving up")
+        warn("another omayap daemon already has the hotkey — leaving it to it")
         return False
 
     def take(self, fd) -> bool:
@@ -275,28 +319,62 @@ class Daemon:
         self.lock_fd = fd
         return True
 
-    def other_pid(self):
+    def write_pid(self) -> None:
+        """A liveness note for the client, and nothing else.
+
+        Nothing is ever signalled on the strength of this file. It exists so
+        `omayap press` can say "daemon is not running" instead of dropping a
+        command into a pipe nobody is reading. Commands themselves go through
+        the control pipe, which only this process can be at the other end of.
+        """
+        token = start_token(os.getpid()) or "0"
+        self.run.write("pid", f"{os.getpid()} {token}\n")
+
+    def open_control(self) -> None:
+        """The pipe every command arrives on.
+
+        A FIFO inside the runtime directory, made fresh by the daemon that
+        holds the lock and opened read-write so the loop never sees
+        end-of-file when no client has it open. Read-write also means the
+        daemon is always a reader, so a client's open never blocks.
+
+        This is what replaced signalling a pid out of a file. A pid is a
+        number the kernel reuses, and checking one before signalling it is
+        never atomic; a descriptor on a pipe that this process created inside
+        a directory only this user can enter cannot be aimed anywhere else.
+        """
+        self.run.unlink("control")
+        self.run.mkfifo("control")
+        self.control_fd = self.run.open("control", os.O_RDWR | os.O_NONBLOCK)
+        self.selector.register(self.control_fd, selectors.EVENT_READ, self.on_control)
+
+    def on_control(self) -> None:
         try:
-            return int((self.run / "pid").read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
-            return None
+            raw = os.read(self.control_fd, 4096)
+        except (BlockingIOError, OSError):
+            return
+        self.control_buffer += raw
+        lines = self.control_buffer.split(b"\n")
+        self.control_buffer = lines.pop()[-64:]
+        for line in lines:
+            command = COMMANDS.get(line.strip().decode("utf-8", "replace"))
+            if command:
+                command(self)
+            elif line.strip():
+                warn(f"ignoring an unknown command: {line[:32]!r}")
 
     def install_signals(self) -> None:
+        """Only the two that mean "stop". Everything else is a command.
+
+        The C-level handler writes the signal number to a pipe, so the Python
+        handler has nothing to do and the loop stays the only place anything
+        happens.
+        """
         read_fd, write_fd = os.pipe()
         os.set_blocking(read_fd, False)
         os.set_blocking(write_fd, False)
-        # The C-level handler writes the signal number to the pipe, so the
-        # Python handler has nothing to do and the loop stays the only place
-        # anything happens.
         signal.set_wakeup_fd(write_fd, warn_on_full_buffer=False)
-        for sig in (
-            PRESS,
-            RELEASE,
-            TOGGLE_DICTATION,
-            TOGGLE_RECORDING,
-            signal.SIGTERM,
-            signal.SIGINT,
-        ):
+        for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: None)
         self.signal_fd = read_fd
         self.selector.register(read_fd, selectors.EVENT_READ, self.on_signal)
@@ -306,17 +384,8 @@ class Daemon:
             raw = os.read(self.signal_fd, 64)
         except (BlockingIOError, OSError):
             return
-        for number in raw:
-            if number == PRESS:
-                self.press()
-            elif number == RELEASE:
-                self.release()
-            elif number == TOGGLE_DICTATION:
-                self.toggle_dictation()
-            elif number == TOGGLE_RECORDING:
-                self.toggle_recording()
-            elif number in (signal.SIGTERM, signal.SIGINT):
-                self.shutdown()
+        if any(number in (signal.SIGTERM, signal.SIGINT) for number in raw):
+            self.shutdown()
 
     def shutdown(self) -> None:
         self.running = False
@@ -333,8 +402,9 @@ class Daemon:
             self.stop_session()
         self.clear_pending()
         if self.child:
-            self.child.terminate()
-        (self.run / "pid").unlink(missing_ok=True)
+            runner.stop(self.child)
+        self.run.unlink("pid")
+        self.run.unlink("control")
         self.write_state()
         warn("stopped")
 
@@ -362,8 +432,7 @@ class Daemon:
         # Truncated and rewritten, never replaced: the QML side watches this
         # exact inode and a rename would leave it watching a deleted file.
         try:
-            with open(self.run / "state", "w", encoding="utf-8") as handle:
-                handle.write(json.dumps(self.snapshot()) + "\n")
+            self.run.rewrite("state", json.dumps(self.snapshot()) + "\n")
         except OSError as error:
             warn(f"cannot write state: {error}")
 
@@ -459,26 +528,40 @@ class Daemon:
         With `newline_after_dictation` the text is followed by Return, which
         turns a dictated line into a sent message or a run command. Only after
         a successful type: a transcript on the clipboard has nothing to submit.
+
+        wtype runs under a deadline and is killed if it wedges. The clipboard
+        fallback runs wl-copy in the foreground, which is the only way to put
+        it under the same rule: on Wayland the process that set the clipboard
+        is the clipboard, so the transcript stays pastable for as long as that
+        process is allowed to live. CLIPBOARD_HOLD is that long, and the toast
+        says so, because a clipboard that empties without warning is worse than
+        one that tells you when it will.
         """
+        payload = text.encode()
         try:
-            typed = subprocess.run(
-                ["wtype", "-"], input=text.encode(), stderr=subprocess.DEVNULL
-            )
+            typed = runner.run("wtype", ["-"], stdin=payload, timeout=TYPE_DEADLINE, capture=False)
         except OSError as error:
-            warn(f"wtype missing: {error}")
+            warn(f"wtype unavailable: {error}")
             typed = None
-        if typed is not None and typed.returncode == 0:
+        if typed is not None and typed.expired:
+            warn(f"wtype did not finish in {int(TYPE_DEADLINE)}s — killed it")
+        if typed is not None and typed.code == 0:
             if config.get("newline_after_dictation"):
                 self.submit()
             return "typed"
         try:
-            subprocess.run(
-                ["wl-copy"], input=text.encode(), stderr=subprocess.DEVNULL, check=False
+            runner.background(
+                "wl-copy", ["--foreground"], stdin=payload, deadline=CLIPBOARD_HOLD
             )
         except OSError as error:
             warn(f"wl-copy failed: {error}")
+            notify("omayap — dictation lost", "nothing could type or copy it", "critical")
             return "lost"
-        notify("omayap", "No text field focused — transcript copied to clipboard")
+        notify(
+            "omayap",
+            "No text field focused — transcript on the clipboard for "
+            f"{int(CLIPBOARD_HOLD / 60)} minutes",
+        )
         return "clipboard"
 
     def submit(self) -> None:
@@ -488,7 +571,7 @@ class Daemon:
         because a failure to press Enter must not lose what was already typed.
         """
         try:
-            subprocess.run(["wtype", "-k", "Return"], stderr=subprocess.DEVNULL)
+            runner.run("wtype", ["-k", "Return"], timeout=CLIP_DEADLINE, capture=False)
         except OSError as error:
             warn(f"newline failed: {error}")
 
@@ -510,12 +593,11 @@ class Daemon:
         self.level_users.add(user)
         if self.levels is not None:
             return
-        path = self.run / "levels"
         try:
-            if not path.is_fifo():
-                path.unlink(missing_ok=True)
-                os.mkfifo(path, 0o600)
-            self.levels = os.open(str(path), os.O_WRONLY | os.O_NONBLOCK)
+            if not self.run.is_fifo("levels"):
+                self.run.unlink("levels")
+                self.run.mkfifo("levels")
+            self.levels = self.run.open("levels", os.O_WRONLY | os.O_NONBLOCK)
         except OSError:
             # ENXIO: nobody is listening. That is the normal case when the HUD
             # is disabled, and it costs nothing.
@@ -553,24 +635,29 @@ class Daemon:
     def start_session(self, title=None, app=None, auto: bool = False) -> None:
         if self.session:
             return
-        root = config.recordings_dir()
         started = datetime.now(timezone.utc)
         try:
-            root.mkdir(parents=True, exist_ok=True)
+            root = vault.open_root(config.recordings_dir())
+        except OSError as error:
+            warn(f"cannot open the recordings directory: {error}")
+            notify("omayap — recording failed", str(error), "critical")
+            return
+        try:
             directory = vault.session_dir(root, started, title)
         except OSError as error:
+            root.close()
             notify("omayap — recording failed", str(error), "critical")
             return
 
         session = Session(
-            directory, started, vault.sanitize_title(title) or None, app, auto
+            root, directory, started, vault.sanitize_title(title) or None, app, auto
         )
         try:
             # System first: it is the track that never fails, so if the mic is
             # going to fail it does so with something already running to stop.
             for track, props in (("system", capture.SYSTEM), ("mic", capture.MIC)):
                 session.procs[track] = capture.record(props)
-                session.files[track] = open(directory / vault.FILES[track], "wb")
+                session.files[track] = vault.open_track(directory, track)
         except OSError as error:
             self.abandon(session, str(error))
             return
@@ -604,11 +691,11 @@ class Daemon:
         for handle in session.files.values():
             handle.close()
         for track in vault.FILES.values():
-            (session.dir / track).unlink(missing_ok=True)
-        try:
-            session.dir.rmdir()
-        except OSError:
-            pass
+            session.dir.unlink(track)
+        name = session.dir.name
+        session.dir.close()
+        session.root.rmdir(name)
+        session.root.close()
         warn(f"recording failed: {reason}")
         notify("omayap — recording failed", reason, "critical")
 
@@ -655,7 +742,11 @@ class Daemon:
         elapsed = int((ended - session.started).total_seconds() * 1000)
         warn(f"○ stopped · {vault.clock(elapsed)} · {vault.stamp(session.started)}")
         vault.log(session.dir, f"recorded {vault.clock(elapsed)}")
+        # The directory stays open until its transcript exists. The child gets
+        # this descriptor rather than the name, so renaming or replacing the
+        # directory in between transcribes nothing and changes nothing.
         self.queue.append(session.dir)
+        session.root.close()
         self.write_state()
         self.pump()
         trim_heap()
@@ -701,7 +792,18 @@ class Daemon:
     # ---- transcription queue -------------------------------------------
 
     def resume_pending(self) -> None:
-        found = vault.pending(config.recordings_dir())
+        try:
+            root = vault.open_root(config.recordings_dir())
+        except OSError as error:
+            warn(f"cannot read the recordings directory: {error}")
+            return
+        found = []
+        with root:
+            for name in vault.pending(root):
+                try:
+                    found.append(root.child(name))
+                except OSError as error:
+                    warn(f"cannot open a pending session: {error}")
         if not found:
             return
         warn(f"resuming {len(found)} untranscribed session(s)")
@@ -713,39 +815,78 @@ class Daemon:
         if self.child or not self.queue or not self.running:
             return
         directory = self.queue.popleft()
-        env = dict(os.environ)
-        root = str(Path(__file__).resolve().parent.parent)
-        env["PYTHONPATH"] = (
-            root
-            if not env.get("PYTHONPATH")
-            else root + os.pathsep + env["PYTHONPATH"]
-        )
+        source = str(Path(__file__).resolve().parent.parent)
+        # The child inherits a copy of the directory descriptor and works
+        # relative to it. The path that follows is for its log lines and for
+        # anyone reading `ps`; nothing is opened by that name.
         try:
-            self.child = subprocess.Popen(
-                [sys.executable, "-m", "omayap", "transcribe", str(directory)], env=env
+            handed = os.dup(directory.fd)
+        except OSError as error:
+            warn(f"cannot hand over the session: {error}")
+            directory.close()
+            return
+        os.set_inheritable(handed, True)
+        try:
+            self.child = runner.spawn(
+                "python",
+                ["-m", "omayap", "transcribe", "--fd", str(handed), directory.path],
+                path=runner.interpreter(),
+                stdout=None,
+                # Its stderr is the journal's, like the daemon's own. A child
+                # that cannot start has to be able to say so somewhere.
+                stderr=None,
+                env=runner.environ(PYTHONPATH=source),
+                pass_fds=(handed,),
             )
         except OSError as error:
             warn(f"cannot start transcription: {error}")
+            directory.close()
             return
+        finally:
+            os.close(handed)
         self.child_dir = directory
+        self.child_at = time.monotonic() + self.child_deadline(directory)
         self.write_state()
+
+    def child_deadline(self, directory) -> float:
+        """How long a transcription of this session is allowed to take.
+
+        Decoding runs at roughly fifty times real time on this model, so four
+        times the recording is not a limit anyone meets by being slow: it is
+        the line between slow and stuck. The floor covers short recordings,
+        where a model load is most of the work.
+        """
+        try:
+            seconds = float(vault.read_meta(directory).get("duration_seconds") or 0)
+        except (OSError, ValueError, AttributeError):
+            seconds = 0.0
+        return max(TRANSCRIBE_FLOOR, seconds * TRANSCRIBE_FACTOR)
 
     def poll_child(self) -> None:
         if not self.child:
             return
         code = self.child.poll()
         if code is None:
-            return
+            if time.monotonic() < self.child_at:
+                return
+            warn("transcription ran past its deadline — killing it")
+            runner.kill_tree(self.child)
+            code = self.child.poll()
+            if code is None:
+                return
         directory = self.child_dir
+        name = directory.name if directory else ""
         self.child = None
         self.child_dir = None
+        if directory:
+            directory.close()
         if code == 0:
-            notify("omayap — transcript ready", directory.name)  # on screen only
+            notify("omayap — transcript ready", name)  # on screen only
         else:
-            warn(f"transcription failed for {vault.stamp_of(directory)}")
+            warn(f"transcription failed for {vault.stamp_of(name)}")
             notify(
                 "omayap — transcription failed",
-                f"{directory.name} — see transcribe.log",
+                f"{name} — see transcribe.log",
                 "normal",
             )
         self.write_state()
@@ -762,12 +903,7 @@ class Daemon:
 
     def detector_start(self) -> None:
         try:
-            self.subscriber = subprocess.Popen(
-                ["pactl", "subscribe"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                bufsize=0,
-            )
+            self.subscriber = runner.spawn("pactl", ["subscribe"], bufsize=0)
         except OSError as error:
             warn(f"meeting detection unavailable: {error}")
             return
@@ -793,11 +929,7 @@ class Daemon:
             self.selector.unregister(proc.stdout.fileno())
         except (KeyError, ValueError, OSError):
             pass
-        proc.terminate()
-        try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        runner.stop(proc)
         warn("meeting detection off")
 
     def on_subscribe(self) -> None:
@@ -919,12 +1051,17 @@ class Daemon:
 
     def pipewire_dump(self):
         try:
-            done = subprocess.run(
-                ["pw-dump"], capture_output=True, text=True, timeout=5
-            )
-            return json.loads(done.stdout)
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
-            warn(f"pw-dump failed: {error}")
+            done = runner.run("pw-dump", timeout=5.0, limit=runner.DUMP_LIMIT)
+        except OSError as error:
+            warn(f"pw-dump unavailable: {error}")
+            return []
+        if done.expired:
+            warn("pw-dump hit its deadline or its output ceiling")
+            return []
+        try:
+            return json.loads(done.out)
+        except ValueError as error:
+            warn(f"pw-dump said something unreadable: {error}")
             return []
 
     def hyprland_windows(self):
@@ -936,27 +1073,26 @@ class Daemon:
         live instance on its own when the variable is absent.
         """
         last = None
-        for env in (None, self.hyprland_fallback_env()):
-            if env is None and "HYPRLAND_INSTANCE_SIGNATURE" not in os.environ:
+        signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+        attempts = [runner.environ()] if signature else []
+        attempts.append(runner.environ(HYPRLAND_INSTANCE_SIGNATURE=None))
+        for env in attempts:
+            try:
+                done = runner.run(
+                    "hyprctl", ["clients", "-j"], timeout=5.0, env=env
+                )
+            except OSError as error:
+                last = error
+                continue
+            if done.expired:
+                last = "hyprctl hit its deadline"
                 continue
             try:
-                done = subprocess.run(
-                    ["hyprctl", "clients", "-j"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                    env=env,
-                )
-                return json.loads(done.stdout)
-            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                return json.loads(done.out)
+            except ValueError as error:
                 last = error
         warn(f"hyprctl failed: {last}")
         return []
-
-    def hyprland_fallback_env(self) -> dict:
-        env = dict(os.environ)
-        env.pop("HYPRLAND_INSTANCE_SIGNATURE", None)
-        return env
 
     # ---- the tick -------------------------------------------------------
 
@@ -975,6 +1111,11 @@ class Daemon:
             self.config_at = now
             self.apply_config()
         self.poll_child()
+        # Anything fired and forgotten gets collected here, and killed if it
+        # has outstayed its deadline.
+        killed = runner.reap()
+        if killed:
+            warn(f"killed {killed} child process(es) that ran past their deadline")
 
     # ---- selector plumbing ---------------------------------------------
 

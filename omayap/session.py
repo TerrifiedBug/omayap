@@ -20,6 +20,13 @@ transcript.md, verbatim shape:
 Speaker tags are exactly `me` (our microphone) and `them` (everyone else).
 Nothing here imports the engine, so the whole contract is testable without a
 126 MB model on disk.
+
+A session is a `safeio.Dir`, not a path: the recordings tree is the one place
+omayap writes that the user gets to point anywhere, including somewhere shared,
+and a two-hour recording is a long time to leave a name resolvable. The tree is
+opened and checked once, the session directory is created inside it with
+mkdir's own exclusivity as the collision check, and every file after that is
+opened relative to that descriptor without following symlinks.
 """
 
 from __future__ import annotations
@@ -28,9 +35,8 @@ import json
 import os
 import re
 from datetime import datetime, timezone
-from pathlib import Path
 
-from . import ENGINE, MODEL
+from . import ENGINE, MODEL, safeio
 
 SPEAKERS = ("me", "them")
 TRACKS = {"mic": "me", "system": "them"}
@@ -39,6 +45,19 @@ FILES = {"mic": "mic.f32", "system": "system.f32"}
 _ALNUM = re.compile(r"[^\W_]", re.UNICODE)
 _WHITESPACE = re.compile(r"\s+")
 TITLE_MAX = 60
+
+# Enough room for a full day of meetings in one directory before giving up.
+MAX_COLLISIONS = 512
+
+
+def open_root(path) -> safeio.Dir:
+    """The recordings tree, created if it is not there yet.
+
+    `private=False`: this one belongs to the user, who may well have it in a
+    synced or shared directory. It still has to be theirs and closed to other
+    people's writes; what it does not have to be is 0700.
+    """
+    return safeio.open_dir(path, create=True, private=False)
 
 
 def stamp(started: datetime) -> str:
@@ -74,38 +93,47 @@ def sanitize_title(title) -> str:
     return text if _ALNUM.search(text) else ""
 
 
-def session_dir(root: Path, started: datetime, title=None) -> Path:
-    """Create and return the session directory.
+def session_dir(root: safeio.Dir, started: datetime, title=None) -> safeio.Dir:
+    """Create and open the session directory, inside the tree's descriptor.
 
     Two calls in the same minute collide, so the counter goes between the
     stamp and the title, as in `2026.01.02-0930-2-Team Standup`, which keeps
-    the vault sorting by time rather than by title.
+    the vault sorting by time rather than by title. The collision is settled by
+    mkdir failing rather than by asking whether the name exists first, which is
+    both shorter and the only version without a race in it.
     """
     base = stamp(started)
     clean = sanitize_title(title)
     suffix = f"-{clean}" if clean else ""
     name = base + suffix
-    counter = 2
-    while (root / name).exists():
-        name = f"{base}-{counter}{suffix}"
-        counter += 1
-    path = root / name
-    path.mkdir(parents=True)
-    return path
+    for counter in range(2, MAX_COLLISIONS + 2):
+        try:
+            root.mkdir(name)
+        except FileExistsError:
+            name = f"{base}-{counter}{suffix}"
+            continue
+        return root.child(name)
+    raise OSError(f"{root.path} already holds {MAX_COLLISIONS} sessions for {base}")
 
 
-def stamp_of(session: Path) -> str:
+def open_track(session: safeio.Dir, track: str):
+    """The file one capture writes into. Fails if anything is there already."""
+    fd = session.open(FILES[track], os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    return os.fdopen(fd, "wb")
+
+
+def stamp_of(session) -> str:
     """The date and time part of a session directory name, title dropped.
 
     For logs: `2026.01.02-0930-2-Weekly Sync` identifies a meeting by name, and
     a journal is a worse place for that than the directory itself.
     """
     parts = str(getattr(session, "name", session)).split("-")
-    return "-".join(parts[:2]) if len(parts) > 2 else "-".join(parts[:2])
+    return "-".join(parts[:2])
 
 
 def write_meta(
-    session: Path,
+    session: safeio.Dir,
     started: datetime,
     ended: datetime,
     offsets: dict,
@@ -127,12 +155,12 @@ def write_meta(
     clean = sanitize_title(title)
     if clean:
         meta["title"] = clean
-    write_json(session / "meta.json", meta)
+    write_json(session, "meta.json", meta)
     return meta
 
 
-def read_meta(session: Path) -> dict:
-    return json.loads((session / "meta.json").read_text(encoding="utf-8"))
+def read_meta(session: safeio.Dir) -> dict:
+    return json.loads(session.read_text("meta.json"))
 
 
 def render_markdown(name: str, segments: list) -> str:
@@ -142,12 +170,13 @@ def render_markdown(name: str, segments: list) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_transcript(session: Path, segments: list) -> list:
+def write_transcript(session: safeio.Dir, segments: list) -> list:
     """transcript.md first: its existence is what marks a session ready."""
     ordered = sorted(segments, key=lambda seg: (seg["start_ms"], seg["end_ms"]))
-    write_text(session / "transcript.md", render_markdown(session.name, ordered))
+    session.write("transcript.md", render_markdown(session.name, ordered))
     write_json(
-        session / "transcript.json",
+        session,
+        "transcript.json",
         {
             "created_at": rfc3339_utc(datetime.now(timezone.utc)),
             "engine": ENGINE,
@@ -158,34 +187,36 @@ def write_transcript(session: Path, segments: list) -> list:
     return ordered
 
 
-def pending(root: Path) -> list:
-    """Sessions with audio and meta but no transcript, oldest name first."""
-    if not root.is_dir():
-        return []
-    return sorted(
-        path
-        for path in root.iterdir()
-        if path.is_dir()
-        and (path / "meta.json").is_file()
-        and not (path / "transcript.json").is_file()
-    )
+def pending(root: safeio.Dir) -> list:
+    """Names of sessions with meta but no transcript, oldest name first.
+
+    Names rather than descriptors: this runs at startup over a whole tree, and
+    holding an open directory for each one only to transcribe them one at a
+    time would be a lot of file descriptors for nothing.
+    """
+    found = []
+    for name in root.names():
+        if not root.is_dir(name):
+            continue
+        try:
+            with root.child(name) as candidate:
+                if candidate.is_file("meta.json") and not candidate.is_file(
+                    "transcript.json"
+                ):
+                    found.append(name)
+        except OSError:
+            continue
+    return sorted(found)
 
 
-def log(session: Path, message: str) -> None:
+def log(session: safeio.Dir, message: str) -> None:
     """transcribe.log lives beside the audio: one session, one story."""
     line = f"{rfc3339_utc(datetime.now(timezone.utc))} {message}\n"
     try:
-        with open(session / "transcribe.log", "a", encoding="utf-8") as handle:
-            handle.write(line)
+        session.append("transcribe.log", line)
     except OSError:
         pass
 
 
-def write_text(path: Path, text: str) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
-
-
-def write_json(path: Path, data) -> None:
-    write_text(path, json.dumps(data, sort_keys=True, indent=2) + "\n")
+def write_json(session: safeio.Dir, name: str, data) -> None:
+    session.write(name, json.dumps(data, sort_keys=True, indent=2) + "\n")

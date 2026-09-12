@@ -1,0 +1,49 @@
+# What omayap installs, locked to its bytes: sherpa-onnx and the one package it
+# depends on, sherpa-onnx-core. Nothing else is in the closure.
+#
+# `pip install --require-hashes` refuses anything whose SHA-256 is not listed
+# here, transitive dependencies included, so the index cannot serve different
+# bytes than the ones reviewed at this commit.
+#
+# Sixteen hashes for two distributions, because the interpreter picks the wheel
+# and this file covers every Python and both Linux architectures Omarchy might
+# be running on. pip takes the wheel whose hash matches and rejects the rest.
+#
+# Regenerating after a version bump, hashes straight from the index:
+#
+#   python3 - <<'PY'
+#   import json, urllib.request
+#   version = "1.13.7"
+#   for package in ("sherpa-onnx", "sherpa-onnx-core"):
+#       url = f"https://pypi.org/pypi/{package}/{version}/json"
+#       with urllib.request.urlopen(url) as response:
+#           files = json.load(response)["urls"]
+#       linux = [
+#           f for f in files
+#           if "manylinux" in f["filename"]
+#           and ("x86_64" in f["filename"] or "aarch64" in f["filename"])
+#       ]
+#       print(f"{package}=={version} \\")
+#       for wheel in sorted(linux, key=lambda f: f["filename"]):
+#           print(f"    --hash=sha256:{wheel['digests']['sha256']} \\")
+#   PY
+
+sherpa-onnx==1.13.7 \
+    --hash=sha256:d3492cf4b0ed55354d06b784456c181f63f5d0747737716a4c2f60bb3c4f346f \
+    --hash=sha256:5089fe5b3aaa127d7973dad6354c02f53089522f4e697676a0b454aa14b42e2e \
+    --hash=sha256:67af75f148d52e0d55d3f77a989ab6d13d581b5fa883afa10ded1d8130f4f6ad \
+    --hash=sha256:254eeee72c7c88cdc8ff3388bc7da4c060a8fcaf3e9b65a3486bd68b110b7464 \
+    --hash=sha256:f2c5a3888aa447ef42a5bf9316c76c60aa749a109e887bd1945401b10aad281e \
+    --hash=sha256:98320c20dd7d9f9b64a4417f0b0169aa8ef3ec6e6091d294c067320df622ae43 \
+    --hash=sha256:05e4d9b208ea08b48cd5aec0a07bc3134c6ca5091d7a3df75fe70dd326eff745 \
+    --hash=sha256:01c4d001390f282bef653d229dce5d9da5009a804999449e33f890139f1f2da0 \
+    --hash=sha256:9d26e4514a04ddd344970b82c7b32e4e1de332312af5cd2f0e8dc385021d4c5e \
+    --hash=sha256:7b4cce2e44f989f6c830103c8449e4df84833f66fa4f625fd092270b54918a55 \
+    --hash=sha256:3bc1fe8dd85a6db146b21db6a1900e1fea0fb4a0dbc27af4401d35407effa401 \
+    --hash=sha256:71a32c04e34c7c4cfc9300c2c4c3ede9cd8b0d1b00ccf0bfa24f202402368855 \
+    --hash=sha256:470f2e2251d13c632b6ba37878bb355cd4672b6feedc57e9d9823bb04ed5df84 \
+    --hash=sha256:08cdb0b0971c27d7f8d13c7c6b090dd284469c46fb2469f23f9d21905db4c6d2
+
+sherpa-onnx-core==1.13.7 \
+    --hash=sha256:861c1e18fbf9bd2c725992c5a1797efe1b934b7df7bb18986d1fdc60e91290c9 \
+    --hash=sha256:e3066e94c24c898c5794e08507f955e14bc904299bac80f357d0bcb7d93e3825

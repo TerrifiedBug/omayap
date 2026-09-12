@@ -70,6 +70,10 @@ def main(argv=None) -> int:
     sub.add_parser("daemon", help="run the dictation and recording daemon")
 
     transcribe_parser = sub.add_parser("transcribe", help="transcribe one session dir")
+    transcribe_parser.add_argument(
+        "--fd",
+        help="an already-open descriptor for that directory, as the daemon passes it",
+    )
     transcribe_parser.add_argument("dir")
 
     config_parser = sub.add_parser("config", help="set one config key")
@@ -88,7 +92,8 @@ def main(argv=None) -> int:
     if args.command == "transcribe":
         from . import transcribe
 
-        return transcribe.main([args.dir])
+        argv = ["--fd", args.fd, args.dir] if args.fd else [args.dir]
+        return transcribe.main(argv)
     if args.command == "config":
         if args.key not in config.DEFAULTS:
             print(
