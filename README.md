@@ -163,15 +163,18 @@ group- or world-writable directory above it. PATH has no say in what gets
 executed. Each child gets an environment built from a short allowlist rather
 than a copy of yours, and a session of its own so it can be stopped as a group.
 
-The ones omayap waits on (`hyprctl`, `pw-dump`, `wtype`, the notification
-sender) have a deadline and a limit on how much they can print, so a wedged or
-endlessly chatty helper cannot stall the dictation key. The ones that stream
-(`pw-record`, `pactl subscribe`) run until omayap stops them, and stopping
-means signalling the whole process group and killing it if it ignores that.
-Their last read before stopping has its own deadline, so a helper that never
-closes its pipe cannot hold the daemon either. A transcription child is
-allowed four times the length of the recording it is decoding before it is
-killed and the session is reported as failed.
+The synchronous ones, where omayap waits for the answer (`hyprctl`, `pw-dump`,
+`wtype`, and the one notification whose id it needs back), have a deadline and
+a limit on how much they can print, so a wedged or endlessly chatty helper
+cannot stall the dictation key. Ordinary notifications are fired and forgotten:
+their output goes nowhere and they are tracked and killed if they are still
+around twenty seconds later. The ones that stream (`pw-record`, `pactl
+subscribe`) run until omayap stops them, and stopping means signalling the
+whole process group and killing it if it ignores that. Their last read before
+stopping has its own deadline, so a helper that never closes its pipe cannot
+hold the daemon either. A transcription child is allowed four times the length
+of the recording it is decoding before it is killed and the session is
+reported as failed.
 
 Files are opened relative to a directory omayap already checked, with
 `O_NOFOLLOW` on the last component, so a symlink dropped in where a file
