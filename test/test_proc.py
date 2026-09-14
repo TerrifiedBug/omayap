@@ -44,7 +44,7 @@ class ToolTable(unittest.TestCase):
         with self.assertRaises(proc.ToolError):
             proc.tool("rm")
         with self.assertRaises(proc.ToolError):
-            proc.tool("/usr/bin/wtype")
+            proc.tool("/usr/bin/wl-copy")
 
     def test_a_listed_program_resolves_to_its_absolute_path(self):
         if not os.path.exists("/usr/bin/pactl"):

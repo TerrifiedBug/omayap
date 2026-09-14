@@ -74,14 +74,15 @@ OFFER_TOAST_MS = 10000
 # few seconds costs about 30 ms and only happens while the toast is up.
 PENDING_POLL = 3.0
 
-# Deadlines for the programs that put a transcript on screen. wtype types a
-# character at a time through a virtual keyboard, so a long transcript is
-# genuinely slow; anything past this is wedged rather than busy, and the daemon
-# has a hotkey to answer.
-TYPE_DEADLINE = 30.0
-CLIP_DEADLINE = 5.0
+# hyprctl and wl-paste answer in milliseconds; anything past this is wedged.
+HYPRCTL_DEADLINE = 5.0
 
-# How long the clipboard fallback keeps a transcript pastable. wl-copy in the
+# How long to wait for wl-copy to own the clipboard before pasting. The chord
+# must not fire until the clipboard is the transcript, or it pastes whatever
+# was there before.
+CLIPBOARD_CONFIRM = 1.0
+
+# How long the transcript stays on the clipboard. wl-copy in the
 # foreground is a process like any other here, so it gets a deadline like any
 # other; five minutes is long enough to switch windows and paste, short enough
 # that a stray transcript is not sitting in the clipboard at the end of the
@@ -523,57 +524,106 @@ class Daemon:
         trim_heap()
 
     def deliver(self, text: str) -> str:
-        """Type it where the cursor is, or fall back to the clipboard.
+        """Paste it where the cursor is, or leave it on the clipboard.
 
-        With `newline_after_dictation` the text is followed by Return, which
+        The transcript goes on the clipboard first and stays there for
+        CLIPBOARD_HOLD: wl-copy in the foreground is the clipboard on Wayland,
+        and a tracked child like any other. Only once wl-paste reads it back
+        does one paste chord go to the focused surface through hyprctl, the
+        same dispatcher Omarchy's SUPER + V uses. A chord that fires early
+        pastes the previous clipboard, so no confirmation means no chord.
+
+        With `newline_after_dictation` the paste is followed by Return, which
         turns a dictated line into a sent message or a run command. Only after
-        a successful type: a transcript on the clipboard has nothing to submit.
-
-        wtype runs under a deadline and is killed if it wedges. The clipboard
-        fallback runs wl-copy in the foreground, which is the only way to put
-        it under the same rule: on Wayland the process that set the clipboard
-        is the clipboard, so the transcript stays pastable for as long as that
-        process is allowed to live. CLIPBOARD_HOLD is that long, and the toast
-        says so, because a clipboard that empties without warning is worse than
-        one that tells you when it will.
+        a paste that landed: a transcript left on the clipboard has nothing to
+        submit.
         """
         payload = text.encode()
-        try:
-            typed = runner.run("wtype", ["-"], stdin=payload, timeout=TYPE_DEADLINE, capture=False)
-        except OSError as error:
-            warn(f"wtype unavailable: {error}")
-            typed = None
-        if typed is not None and typed.expired:
-            warn(f"wtype did not finish in {int(TYPE_DEADLINE)}s — killed it")
-        if typed is not None and typed.code == 0:
-            if config.get("newline_after_dictation"):
-                self.submit()
-            return "typed"
         try:
             runner.background(
                 "wl-copy", ["--foreground"], stdin=payload, deadline=CLIPBOARD_HOLD
             )
         except OSError as error:
             warn(f"wl-copy failed: {error}")
-            notify("omayap — dictation lost", "nothing could type or copy it", "critical")
+            notify("omayap — dictation lost", "nothing could copy it", "critical")
             return "lost"
+        if not self.clipboard_holds(payload):
+            warn("clipboard did not take the transcript")
+            return self.left_on_clipboard()
+        mods, key = detect.paste_chord(self.active_window())
+        if not self.press_key(mods, key):
+            return self.left_on_clipboard()
+        if config.get("newline_after_dictation"):
+            self.submit()
+        return "pasted"
+
+    def clipboard_holds(self, payload: bytes) -> bool:
+        """True once wl-paste reads back exactly what was copied.
+
+        wl-copy backgrounds itself before it owns the selection, so the only
+        honest confirmation is reading it back.
+        """
+        deadline = time.monotonic() + CLIPBOARD_CONFIRM
+        while True:
+            try:
+                done = runner.run("wl-paste", ["--no-newline"], timeout=HYPRCTL_DEADLINE)
+            except OSError as error:
+                warn(f"wl-paste unavailable: {error}")
+                return False
+            if not done.expired and done.code == 0 and done.out == payload:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+    def active_window(self) -> dict:
+        """The focused window as hyprctl describes it, or {}."""
+        done = self.hyprctl(["activewindow", "-j"])
+        if done is None:
+            return {}
+        try:
+            window = json.loads(done.out)
+        except ValueError:
+            return {}
+        return window if isinstance(window, dict) else {}
+
+    def press_key(self, mods: str, key: str) -> bool:
+        """One synthetic key with explicit modifiers, down then up.
+
+        Split into two dispatches because a single send_shortcut sometimes
+        leaves synthetic key state stuck or repeating (Omarchy's
+        clipboard.lua, hyprwm/Hyprland discussion #14099). mods and key are
+        fixed literals from paste_chord, never anything a transcript can
+        reach, so building the Lua call as a string is safe.
+        """
+        for state in ("down", "up"):
+            table = f'{{ mods = "{mods}", key = "{key}", state = "{state}" }}'
+            done = self.hyprctl(["dispatch", f"hl.dsp.send_key_state({table})"])
+            if done is None or done.code != 0 or done.out.strip() != b"ok":
+                said = done.out.decode(errors="replace").strip() if done else "no answer"
+                warn(f"hyprctl dispatch {state} {mods}+{key}: {said}")
+                return False
+            if state == "down":
+                time.sleep(0.05)
+        return True
+
+    def left_on_clipboard(self) -> str:
         notify(
             "omayap",
-            "No text field focused — transcript on the clipboard for "
+            "Could not paste — transcript on the clipboard for "
             f"{int(CLIPBOARD_HOLD / 60)} minutes",
         )
         return "clipboard"
 
     def submit(self) -> None:
-        """Return, on its own keystroke.
+        """Return, on its own keystroke, after the paste has landed.
 
-        Separate from the text because wtype reads the words from stdin, and
-        because a failure to press Enter must not lose what was already typed.
+        A failure here must not lose what was already pasted, so it only
+        warns.
         """
-        try:
-            runner.run("wtype", ["-k", "Return"], timeout=CLIP_DEADLINE, capture=False)
-        except OSError as error:
-            warn(f"newline failed: {error}")
+        time.sleep(0.05)
+        if not self.press_key("", "Return"):
+            warn("newline failed")
 
     def toggle_dictation(self) -> None:
         if self.dictation == "listening":
@@ -1064,8 +1114,8 @@ class Daemon:
             warn(f"pw-dump said something unreadable: {error}")
             return []
 
-    def hyprland_windows(self):
-        """Every open window, or an empty list.
+    def hyprctl(self, args, *, timeout: float = HYPRCTL_DEADLINE):
+        """Run hyprctl to completion, or None.
 
         Retried without HYPRLAND_INSTANCE_SIGNATURE because the daemon
         outlives the compositor: if Hyprland restarts, the signature this
@@ -1078,21 +1128,32 @@ class Daemon:
         attempts.append(runner.environ(HYPRLAND_INSTANCE_SIGNATURE=None))
         for env in attempts:
             try:
-                done = runner.run(
-                    "hyprctl", ["clients", "-j"], timeout=5.0, env=env
-                )
+                done = runner.run("hyprctl", list(args), timeout=timeout, env=env)
             except OSError as error:
                 last = error
                 continue
             if done.expired:
                 last = "hyprctl hit its deadline"
                 continue
-            try:
-                return json.loads(done.out)
-            except ValueError as error:
-                last = error
-        warn(f"hyprctl failed: {last}")
-        return []
+            if done.code != 0:
+                # A stale signature is exit 4 and a line about a socket that
+                # is not there; anything non-zero is worth the second attempt.
+                last = done.out.decode(errors="replace").strip() or f"exit {done.code}"
+                continue
+            return done
+        warn(f"hyprctl {args[0]} failed: {last}")
+        return None
+
+    def hyprland_windows(self):
+        """Every open window, or an empty list."""
+        done = self.hyprctl(["clients", "-j"])
+        if done is None:
+            return []
+        try:
+            return json.loads(done.out)
+        except ValueError as error:
+            warn(f"hyprctl said something unreadable: {error}")
+            return []
 
     # ---- the tick -------------------------------------------------------
 

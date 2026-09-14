@@ -1,7 +1,7 @@
 """Every external program omayap runs, resolved once and run in a closed world.
 
 The daemon lives as long as the login session does and runs eight programs it
-did not write: pw-record, pactl, pw-dump, hyprctl, wtype, wl-copy, busctl and
+did not write: pw-record, pactl, pw-dump, hyprctl, wl-copy, wl-paste, busctl and
 Omarchy's notification sender. Inheriting PATH for those is how a writable
 directory early in someone's PATH turns a dictation key into arbitrary code, so
 nothing here consults PATH. A name is resolved against a fixed list of system
@@ -37,8 +37,8 @@ TOOLS = {
     "pactl": ("/usr/bin/pactl",),
     "pw-dump": ("/usr/bin/pw-dump",),
     "hyprctl": ("/usr/bin/hyprctl",),
-    "wtype": ("/usr/bin/wtype",),
     "wl-copy": ("/usr/bin/wl-copy",),
+    "wl-paste": ("/usr/bin/wl-paste",),
     "busctl": ("/usr/bin/busctl",),
     "omarchy-notification-send": (
         "/usr/share/omarchy/bin/omarchy-notification-send",
@@ -140,7 +140,7 @@ def _rejection(path: str, *, root_only: bool) -> str | None:
     """Why this file must not be executed, or None if it may be.
 
     The file and every directory above it, because a program is only as fixed
-    as the least fixed directory on the way to it: /usr/bin/wtype cannot be
+    as the least fixed directory on the way to it: /usr/bin/wl-copy cannot be
     swapped by anyone but root, and neither can /usr or /.
     """
     real = os.path.realpath(path)
@@ -222,7 +222,6 @@ def run(
     limit: int = LIMIT,
     stdin: bytes | None = None,
     env=None,
-    capture: bool = True,
 ) -> Result:
     """Run a child to completion under a deadline and an output ceiling.
 
@@ -231,17 +230,12 @@ def run(
     before it. Nothing here ever blocks longer than `timeout`, which is the
     point: this runs on the daemon's only thread, between a key press and the
     words appearing.
-
-    `capture=False` for a program that forks and leaves a child holding the
-    pipe. wl-copy is the one: it backgrounds itself to own the clipboard, so
-    waiting for end-of-file on its stdout would mean waiting for the user's
-    next copy, and then killing the thing holding their transcript.
     """
     proc = spawn(
         name,
         args,
         stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
-        stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
         env=env,
         bufsize=0,
     )
@@ -253,9 +247,8 @@ def run(
         if stdin:
             os.set_blocking(proc.stdin.fileno(), False)
             selector.register(proc.stdin, selectors.EVENT_WRITE)
-        if capture:
-            os.set_blocking(proc.stdout.fileno(), False)
-            selector.register(proc.stdout, selectors.EVENT_READ)
+        os.set_blocking(proc.stdout.fileno(), False)
+        selector.register(proc.stdout, selectors.EVENT_READ)
         pending = memoryview(stdin) if stdin else memoryview(b"")
         while selector.get_map():
             left = deadline - time.monotonic()

@@ -122,7 +122,7 @@ Panel {
         Toggle {
           width: parent.width
           label: "Enter after dictating"
-          description: "Sends the line as soon as it is typed"
+          description: "Sends the line as soon as it is pasted"
           checked: root.config.newline_after_dictation === true
           onClicked: root.toggleSetting("newline_after_dictation")
         }

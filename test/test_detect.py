@@ -243,5 +243,20 @@ class TestWindowTitle(unittest.TestCase):
         self.assertEqual(detect.pid_chain(5, ppid=lambda pid: 5), [5])
 
 
+class PasteChord(unittest.TestCase):
+    """Which shortcut pastes into the focused window."""
+
+    def test_a_terminal_takes_shift_insert(self):
+        window = {"class": "com.mitchellh.ghostty", "tags": ["terminal*", "default-opacity*"]}
+        self.assertEqual(detect.paste_chord(window), ("SHIFT", "Insert"))
+
+    def test_everything_else_takes_ctrl_v(self):
+        window = {"class": "google-chrome", "tags": ["chromium-based-browser*"]}
+        self.assertEqual(detect.paste_chord(window), ("CTRL", "v"))
+
+    def test_a_layer_surface_has_no_window_and_still_gets_a_chord(self):
+        self.assertEqual(detect.paste_chord({}), ("CTRL", "v"))
+
+
 if __name__ == "__main__":
     unittest.main()

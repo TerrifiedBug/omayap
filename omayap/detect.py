@@ -201,6 +201,21 @@ def window_title(pid, windows, binary=None, chain=None):
     return None
 
 
+def paste_chord(window) -> tuple[str, str]:
+    """The paste shortcut Omarchy's own SUPER + V would send to this window.
+
+    `window` is `hyprctl activewindow -j`: a dict, or {} when a layer surface
+    has focus. Terminals are whatever carries Omarchy's `terminal` tag, the
+    same rule as default/hypr/bindings/clipboard.lua, because a terminal
+    takes CTRL + V as a literal control character. Dynamic tags end in `*`.
+    """
+    tags = window.get("tags") if isinstance(window, dict) else None
+    for tag in tags or ():
+        if str(tag).rstrip("*") == "terminal":
+            return ("SHIFT", "Insert")
+    return ("CTRL", "v")
+
+
 # What browsers and meeting apps hang off the end of a title. Stripped by
 # name because the binary is only ever one of them: a Google Meet call in
 # Chromium is titled "Standup - Google Meet - Google Chrome", and the meeting

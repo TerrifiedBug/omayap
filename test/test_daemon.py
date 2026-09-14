@@ -23,6 +23,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from omayap import MIN_SAMPLES, daemon, safeio  # noqa: E402
 
 
+# How much a pipe holds varies with how many pipes the user already has open:
+# 64 KB here, 8 KB on a machine over the kernel's per-user soft limit. One
+# page always fits, and anything larger written in one go can deadlock the
+# writer against itself.
+PIPE_CHUNK = 4096
+
+
 class FakeCapture:
     """A pipe with a writable end we close to simulate pw-record exiting."""
 
@@ -47,8 +54,14 @@ class FakeCapture:
     def kill(self) -> None:
         self.exit_code = -9
 
-    def feed(self, payload: bytes) -> None:
-        os.write(self.write_fd, payload)
+    def feed(self, payload: bytes, drain=None) -> None:
+        """Write it all, letting the reader catch up between chunks."""
+        view = memoryview(payload)
+        while view:
+            written = os.write(self.write_fd, view[:PIPE_CHUNK])
+            view = view[written:]
+            if view and drain:
+                drain()
 
     def die(self) -> None:
         os.close(self.write_fd)
@@ -122,8 +135,10 @@ class DictationCaptureLoss(unittest.TestCase):
     def test_speech_captured_before_the_capture_died_is_still_transcribed(self):
         spoken = []
         self.daemon.engine = type("Engine", (), {"text": lambda _self, s: "hello"})()
-        self.daemon.deliver = lambda text: spoken.append(text) or "typed"
-        self.capture.feed(b"\x00\x00\x00\x00" * (MIN_SAMPLES + 10))
+        self.daemon.deliver = lambda text: spoken.append(text) or "pasted"
+        self.capture.feed(
+            b"\x00\x00\x00\x00" * (MIN_SAMPLES + 10), drain=self.daemon.on_dictation_audio
+        )
         self.daemon.on_dictation_audio()
         self.capture.die()
         self.daemon.on_dictation_audio()

@@ -11,8 +11,8 @@ replaces voxtype.
 
 ## What it does
 
-Dictation: press your key, speak, press again. The text is typed into whatever
-window had focus, or copied to the clipboard if nothing will take keystrokes. A
+Dictation: press your key, speak, press again. The text is pasted into whatever
+window had focus, and stays on the clipboard if the paste does not land. A
 press shorter than 0.3 s is ignored.
 
 Meetings: your microphone and everything the speakers play, recorded as two
@@ -33,7 +33,7 @@ short-lived process of its own.
 
 Needs Omarchy 4.x, PipeWire, `python3`, and about 185 MB of disk for the venv
 and the models. `pw-record`,
-`wtype`, `wl-copy`, `pactl`, `pw-dump`, `hyprctl` and `setpriv` all ship with
+`wl-copy`, `wl-paste`, `pactl`, `pw-dump`, `hyprctl` and `setpriv` all ship with
 Omarchy.
 
 ```bash
@@ -53,10 +53,10 @@ Then bind a key in `~/.config/hypr/bindings.lua` and run `hyprctl reload`:
 o.bind("SUPER + CTRL + Y", "Toggle dictation", "~/.local/bin/omayap toggle", { release = true })
 ```
 
-Bind on release. The transcript is typed by a virtual keyboard, and a modifier
-you are still holding merges into every letter, so `hello` becomes five
-`SUPER + CTRL` shortcuts. Push-to-talk needs a key of its own because it binds
-both a press and a release:
+Bind on release. The paste chord is injected at the seat, so a modifier you are
+still holding merges into it and the paste turns into some other shortcut.
+Push-to-talk needs a key of its own because it binds both a press and a
+release:
 
 ```lua
 o.bind("F10", "Start dictation (push-to-talk)", "~/.local/bin/omayap press")
@@ -87,7 +87,7 @@ press reads the file.
 | --- | --- | --- |
 | `recordings_dir` | `~/Recordings` | Where sessions go |
 | `keep_audio` | `true` | Keep the two tracks beside the transcript. 3.8 MB a minute per track |
-| `newline_after_dictation` | `false` | Press Enter once the text is typed |
+| `newline_after_dictation` | `false` | Press Enter once the text is pasted |
 | `meeting_detection` | `false` | Watch for another app taking the microphone |
 | `meeting_auto_record` | `false` | Start recording without asking |
 | `meeting_excluded_apps` | `[]` | Names to ignore, matched against the stream name and the binary |
@@ -164,7 +164,7 @@ executed. Each child gets an environment built from a short allowlist rather
 than a copy of yours, and a session of its own so it can be stopped as a group.
 
 The synchronous ones, where omayap waits for the answer (`hyprctl`, `pw-dump`,
-`wtype`, and the one notification whose id it needs back), have a deadline and
+`wl-paste`, and the one notification whose id it needs back), have a deadline and
 a limit on how much they can print, so a wedged or endlessly chatty helper
 cannot stall the dictation key. Ordinary notifications are fired and forgotten:
 their output goes nowhere and they are tracked and killed if they are still
@@ -192,11 +192,16 @@ running: a pid is a number the kernel reuses, and checking one before `kill`
 is never atomic, so nothing here depends on it. Two daemons cannot fight over
 the microphone either; the second one finds the lock taken and exits.
 
-One thing to know about the clipboard fallback: when nothing takes the typed
-transcript, omayap puts it on the clipboard with `wl-copy --foreground`, and on
-Wayland that process is the clipboard. It is held to the same rule as every
-other child and killed after five minutes, so the transcript stops being
-pastable then. The notification tells you.
+How the text gets there: omayap puts the transcript on the clipboard with
+`wl-copy --foreground`, reads it back with `wl-paste` to be sure the clipboard
+is the transcript and not whatever was there before, then sends one paste chord
+through `hyprctl`. `SHIFT + Insert` in a terminal, `CTRL + V` everywhere else,
+which is the rule Omarchy's own `SUPER + V` follows. No virtual keyboard:
+`wtype` builds a keymap one character at a time, and Hyprland drops some of
+those keys, so letters go missing from the sentence. On Wayland the
+process that set the clipboard is the clipboard, so `wl-copy` is held to the
+same rule as every other child and killed after five minutes. The transcript
+stops being pastable then.
 
 ## Troubleshooting
 
@@ -207,8 +212,9 @@ omayap status
 ```
 
 "daemon is not running": `systemctl --user start omayap`. "model still
-loading": the first half second after the service starts. Nothing typed: the
-focused surface would not take keystrokes and the text is on your clipboard.
+loading": the first half second after the service starts. Nothing pasted: the
+focused surface refused the chord and the text is on your clipboard, so
+`SUPER + V` still puts it where you wanted it.
 Key does nothing: check `hyprctl binds` for a second bind on it. A recording
 with no transcript: read `transcribe.log` in the session directory, and the
 daemon retries untranscribed sessions when it next starts.
