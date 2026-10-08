@@ -3,6 +3,7 @@ import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "HudModel.js" as Hud
 import "Model.js" as Model
@@ -176,8 +177,8 @@ Item {
       // one row under it and nothing else moves.
       width: content.width + Style.space(22)
       height: content.height + Style.space(16)
-      color: Util.alpha(Color.background, 0.97)
-      borderSpec: Border.surfaceSpec("popups", "border", Color.popups.border, Math.max(1, Style.space(2)))
+      color: Util.alpha(Commons.Color.background, 0.97)
+      borderSpec: Border.surfaceSpec("popups", "border", Commons.Color.popups.border, Math.max(1, Style.space(2)))
       radius: Style.cornerRadius
       opacity: root.showing ? 1 : 0
       Behavior on opacity { NumberAnimation { duration: 120 } }
@@ -225,7 +226,7 @@ Item {
                 width: root.block
                 height: root.block
                 visible: Hud.columnLit(root.wave[columnCells.column], index, Hud.WAVE_STEPS)
-                color: Color.urgent
+                color: Commons.Color.urgent
                 antialiasing: false
                 radius: 0
               }
@@ -241,7 +242,7 @@ Item {
           cols: Hud.WAVE_COLUMNS
           pitch: root.pitch
           block: root.block
-          barColor: Color.accent
+          barColor: Commons.Color.accent
           running: root.scanning
         }
 
@@ -252,7 +253,7 @@ Item {
           // accent from the moment they start moving, in one cut rather than a
           // fade: releasing the key stops the recording, so urgent would be
           // saying something untrue for as long as the blocks were in the air.
-          blockColor: Color.accent
+          blockColor: Commons.Color.accent
           running: root.morphing
         }
       }
@@ -269,7 +270,7 @@ Item {
           anchors.verticalCenter: parent.verticalCenter
           textFormat: Text.PlainText
           text: "\uf111 " + root.elapsed  // nf-fa-circle
-          color: Color.urgent
+          color: Commons.Color.urgent
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
         }
@@ -279,7 +280,7 @@ Item {
           iconText: "\uf00d"  // nf-fa-times
           tooltipText: "Stop recording"
           bordered: true
-          foreground: Color.foreground
+          foreground: Commons.Color.foreground
           // The one interactive pixel on the HUD. The window mask covers the
           // card only, so everything around it still clicks through.
           onClicked: if (root.daemon) root.daemon.record()

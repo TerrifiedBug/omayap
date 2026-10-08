@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 
@@ -106,7 +107,7 @@ BarWidget {
           height: width
           radius: width / 2
           visible: root.busy
-          color: root.mode === "recording" ? Color.urgent : Color.accent
+          color: root.mode === "recording" ? Commons.Color.urgent : Commons.Color.accent
           antialiasing: true
         }
       }

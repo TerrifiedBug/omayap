@@ -235,6 +235,12 @@ cd ~ && omarchy plugin remove io.github.terrifiedbug.omayap
 Then delete omayap's binds and run `hyprctl reload`. Your recordings are never
 touched.
 
+## Theme compatibility
+
+Theme colors use a namespaced `qs.Commons.Color` import to avoid Qt 6.12's
+`Color` name collision. This keeps the existing palette roles and fallbacks
+without changing the plugin's Omarchy requirements.
+
 ## Credits and licence
 
 MIT. See `LICENSE` and `NOTICE`.

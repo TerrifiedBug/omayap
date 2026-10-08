@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 
@@ -32,7 +33,7 @@ Panel {
   readonly property var config: service ? service.config : Model.DEFAULT_CONFIG
   readonly property bool recording: !!snapshot.recording
 
-  readonly property color contentForeground: bar ? bar.foreground : Color.foreground
+  readonly property color contentForeground: bar ? bar.foreground : Commons.Color.foreground
   readonly property color dimmedForeground: Qt.darker(contentForeground, 1.8)
   readonly property string contentFontFamily: bar ? bar.fontFamily : Style.font.family
 
